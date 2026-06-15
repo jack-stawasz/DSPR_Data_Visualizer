@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSPR Training Data Viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="/frontend/styles.css" />
+<script defer src="/frontend/app.js"></script>
+</head>
+<body>
+<header>
+  <h1>DSPR Training Data Viewer</h1>
+  <div class="sub">Browse paired math problems, pull new MATH problems, and author perturbations.</div>
+  <div class="nav">
+    <button id="navBrowse" class="active">Browse</button>
+    <button id="navCreate">Create</button>
+  </div>
+  <div class="controls" id="browseControls">
+    <input type="text" id="search" placeholder="Search by ID or text..." />
+    <select id="typeFilter"><option value="">All types</option></select>
+    <button id="toggleAllBtn">Show all answers</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="loader-row" id="loaderRow"></div>
+</header>
+<main>
+  <div id="browseView" class="view">
+    <div id="list"></div>
+    <div class="empty hidden" id="empty">No problems match your filters.</div>
+  </div>
+
+  <div id="createView" class="view hidden">
+    <!-- Step 1: Pull problems — browse a dataset source, filter/sort, pull one at a time. -->
+    <div id="tabPull" class="ctab">
+      <div class="section">
+        <h2 class="step-title">Pull problems</h2>
+        <p class="hint">Browse a source dataset, filter and sort, then pull individual problems into
+          <code class="kbd">data/DSPR_dataset.json</code> (status: Original) &mdash; you author the perturbations in step 2.</p>
+
+        <!-- Dataset source tabs — built by JS from /api/datasets. -->
+        <div class="ds-tabs" id="dsTabs"></div>
+        <div class="ds-desc muted" id="dsDesc"></div>
+
+        <!-- Search + sort + clear, mirroring the Projects page controls. -->
+        <div class="ds-controls">
+          <input type="text" id="dsSearch" class="ds-search" placeholder="Search problems…" aria-label="Search problems" />
+          <select id="dsSort" class="ds-sort" aria-label="Sort records">
+            <option value="">Sort: default</option>
+          </select>
+          <button id="dsClear" type="button">Clear filters</button>
+          <button id="dsReload" type="button">Reload</button>
+          <span class="count" id="dsCount"></span>
+        </div>
+
+        <div class="ds-layout">
+          <!-- Filter panel — facet groups built dynamically per dataset. -->
+          <aside class="ds-filters" id="dsFilters"></aside>
+          <!-- Single focused problem, navigated one at a time (shared Problem Viewer). -->
+          <div class="ds-main">
+            <div class="pv-nav">
+              <button id="dsPrev" type="button">&larr; Prev</button>
+              <span id="dsIndicator" class="nav-indicator">&mdash;</span>
+              <button id="dsNext" type="button">Next &rarr;</button>
+              <span class="nav-jump">
+                <input type="number" id="dsJump" class="nav-jump-input" min="1" placeholder="#" aria-label="Jump to problem index" />
+                <button id="dsJumpGo" type="button">Go</button>
+              </span>
+            </div>
+            <div id="dsViewer">
+              <div class="empty">Select a dataset above to start browsing.</div>
+            </div>
+            <div class="save-row">
+              <button id="dsPull" class="btn-accent" disabled>Pull this problem &rarr;</button>
+              <button id="dsPullAll" type="button" disabled>Pull all selected &rarr;</button>
+            </div>
+          </div>
+        </div>
+        <div class="status" id="pullStatus"></div>
+      </div>
+    </div>
+
+    <!-- Step 2: Author perturbations -->
+    <div id="tabCreate" class="ctab">
+      <div class="section">
+        <h2 class="step-title">Generate a perturbation</h2>
+        <p class="hint">Pick a base problem (status: Original in <code class="kbd">data/DSPR_dataset.json</code>), then author a
+          <b>simple</b> and <b>hard</b> variant manually or generate them with an LLM.
+          Saving adds them with status Unverified for review in step 3.</p>
+        <!-- Generation mode selector — buttons are built by JS from GEN_MODES. -->
+        <div class="subnav" id="genModeNav"></div>
+        <div class="status" id="generateStatus"></div>
+        <div class="field">
+          <label>Base problem</label>
+          <div class="pv-nav">
+            <button id="basePrev" type="button">&larr; Prev</button>
+            <span id="baseIndicator" class="nav-indicator">&mdash;</span>
+            <button id="baseNext" type="button">Next &rarr;</button>
+            <span class="nav-jump">
+              <input type="number" id="baseJump" class="nav-jump-input" min="1" placeholder="#" aria-label="Jump to problem index" />
+              <button id="baseJumpGo" type="button">Go</button>
+            </span>
+          </div>
+        </div>
+
+        <div class="card">
+          <!-- Shared Problem Viewer display (header + tags + centered original + answer). -->
+          <div id="genDisplay" class="pv-host">
+            <div class="hint">Select a base problem above.</div>
+          </div>
+
+          <!-- Manual Creation mode: hand-written simple/hard variants. -->
+          <div id="modeManual" class="gen-mode">
+            <div class="grid2">
+              <div class="vcol simple">
+                <h3>Simple</h3>
+                <div class="field">
+                  <label for="simpleProblem">Problem</label>
+                  <textarea id="simpleProblem" class="autogrow" placeholder="Same method, changed values..."></textarea>
+                </div>
+                <div class="field">
+                  <label for="simpleAnswer">Answer</label>
+                  <input type="text" id="simpleAnswer" placeholder="e.g. 42 or \frac{1}{2}" />
+                </div>
+                <div class="preview-label">Preview</div>
+                <div class="preview" id="simplePreview"></div>
+              </div>
+
+              <div class="vcol hard">
+                <h3>Hard</h3>
+                <div class="field">
+                  <label for="hardProblem">Problem</label>
+                  <textarea id="hardProblem" class="autogrow" placeholder="Alter a condition so the original method breaks..."></textarea>
+                </div>
+                <div class="field">
+                  <label for="hardAnswer">Answer</label>
+                  <input type="text" id="hardAnswer" placeholder="e.g. 17 or \sqrt{2}" />
+                </div>
+                <div class="preview-label">Preview</div>
+                <div class="preview" id="hardPreview"></div>
+              </div>
+            </div>
+
+            <div class="field" style="max-width:260px;margin-top:16px;margin-bottom:0">
+              <label for="createAuthor">Your name (required)</label>
+              <input type="text" id="createAuthor" placeholder="e.g. jack" />
+            </div>
+            <div class="save-row">
+              <button id="savePerturbation" class="btn-accent">Save Perturbation</button>
+              <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
+                <input type="checkbox" id="autoVerify" /> Auto-verify
+                <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- LLM Generation mode: backend/GPU status + one-click generation. -->
+          <div id="modeLLM" class="gen-mode hidden">
+            <div class="llm-status-head">
+              <h3>LLM generation status</h3>
+              <button id="llmStatusRefresh" type="button">Refresh status</button>
+            </div>
+            <div id="llmStatusBody">
+              <div class="hint">Status not checked yet.</div>
+            </div>
+            <div id="llmAvailability" class="llm-banner err">Status not checked yet.</div>
+            <div class="save-row">
+              <button id="llmGenerateBtn" class="btn-accent" disabled
+                title="Generate simple + hard perturbations for this problem with the configured LLM">LLM Generation</button>
+              <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
+                <input type="checkbox" id="llmAutoVerify" /> Auto-verify
+                <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="status" id="saveStatus"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Verify -->
+    <div id="tabVerify" class="ctab">
+      <div class="section">
+        <div class="card-head" style="margin-bottom:4px">
+          <h2 class="step-title" style="margin:0">Verify perturbations</h2>
+          <button id="refreshPending" style="margin-left:auto">Refresh</button>
+        </div>
+        <p class="hint">Review each problem's perturbations from <code class="kbd">data/DSPR_dataset.json</code> (status: Unverified).
+          The original, simple, and hard variants are approved together as a pair:
+          <b>Approve</b> marks the whole record Verified in place; <b>Reject</b> clears the
+          perturbations and returns the base problem to the Generate pool.</p>
+        <div class="status" id="verifyStatus"></div>
+        <div class="field" style="max-width:260px;margin-bottom:14px">
+          <label for="verifyAuthor">Verifier name (required for Approve)</label>
+          <input type="text" id="verifyAuthor" placeholder="e.g. jack" />
+        </div>
+        <div class="field">
+          <label>Pending problem</label>
+          <div class="pv-nav">
+            <button id="verifyPrev" type="button">&larr; Prev</button>
+            <span id="verifyIndicator" class="nav-indicator">&mdash;</span>
+            <button id="verifyNext" type="button">Next &rarr;</button>
+            <span class="nav-jump">
+              <input type="number" id="verifyJump" class="nav-jump-input" min="1" placeholder="#" aria-label="Jump to problem index" />
+              <button id="verifyJumpGo" type="button">Go</button>
+            </span>
+          </div>
+        </div>
+        <div id="verifyList"></div>
+      </div>
+    </div>
+  </div>
+</main>
+</body>
+</html>

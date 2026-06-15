@@ -1,0 +1,13 @@
+# Personal Ollama / SSH config — real values, never committed.
+# Copy ollama.local.sh.example -> ollama.local.sh and fill it in.
+ollama.local.sh
+
+# Disposable local virtualenv (rebuilt by start.sh from requirements.txt).
+venv/
+
+# Python bytecode caches.
+__pycache__/
+
+# Local Claude Code config and project guidance (machine-specific, not shared).
+.claude/
+CLAUDE.md

@@ -1,0 +1,44 @@
+#!/bin/bash
+# ─── Personal Ollama / SSH config (TEMPLATE) ──────────────────────────────────
+# Copy this file to `ollama.local.sh` and fill in your own values:
+#
+#     cp ollama.local.sh.example ollama.local.sh
+#
+# `ollama.local.sh` is git-ignored, so your host/usernames never get committed.
+# start.sh sources it automatically (if present) before launching the server.
+#
+# Two ways to use the frontend "LLM Generation" feature:
+#
+#   A) Local Ollama (simplest): run `ollama serve` on this machine, leave the
+#      SSH_* / TUNNEL_PORT vars below blank, and set
+#          export OLLAMA_HOST="http://localhost:11434"
+#      No tunnel is opened.
+#
+#   B) Remote Ollama over an SSH tunnel (what the original author uses): set the
+#      SSH_* vars and TUNNEL_PORT below. start.sh then opens
+#          ssh -N -f -J "$SSH_JUMP" -L ${TUNNEL_PORT}:localhost:11434 "$SSH_TARGET" -p "$SSH_PORT"
+#      forwarding your local TUNNEL_PORT to the remote host's `ollama serve`
+#      (which listens on 11434). A non-default local port (e.g. 11500) avoids
+#      colliding with any Ollama already running locally on 11434.
+#
+# The tunnel opens only when BOTH SSH_TARGET and TUNNEL_PORT are set.
+
+# --- Remote SSH host (option B). Leave blank for a local Ollama (option A). ---
+SSH_JUMP=""              # optional jump/bastion, e.g. "user@bastion.example.edu"
+SSH_TARGET=""            # remote Ollama host, e.g. "user@gpu-box.example.edu"
+SSH_PORT=22              # SSH port of SSH_TARGET
+TUNNEL_PORT=""           # local port to forward, e.g. 11500 (blank = no tunnel)
+
+# --- Where the generator looks for Ollama. ---
+# Option A: http://localhost:11434   Option B: http://localhost:${TUNNEL_PORT}
+export OLLAMA_HOST="http://localhost:11434"
+
+# Model served by Ollama (optional; claude_generate.py defaults to qwen2.5:7b).
+# export OLLAMA_MODEL="qwen2.5:7b"
+
+# --- GPU status (optional). ---
+# Lets /api/llm_status run `nvidia-smi` on the remote host over SSH when this
+# server runs somewhere without a GPU. Leave blank to run nvidia-smi locally
+# (or skip it). For option B, mirror your SSH args, e.g.:
+#   export GPU_SSH="-J $SSH_JUMP -p $SSH_PORT $SSH_TARGET"
+export GPU_SSH=""
