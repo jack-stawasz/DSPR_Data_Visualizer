@@ -167,8 +167,12 @@
             </div>
             <div id="llmAvailability" class="llm-banner err">Status not checked yet.</div>
             <div class="save-row">
+              <label class="model-pick" title="Choose which model installed on the Ollama host to generate with">
+                Model
+                <select id="llmModel" disabled><option>—</option></select>
+              </label>
               <button id="llmGenerateBtn" class="btn-accent" disabled
-                title="Generate simple + hard perturbations for this problem with the configured LLM">LLM Generation</button>
+                title="Generate simple + hard perturbations for this problem with the selected model">LLM Generation</button>
               <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
                 <input type="checkbox" id="llmAutoVerify" /> Auto-verify
                 <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>

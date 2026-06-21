@@ -22,6 +22,11 @@
 #      colliding with any Ollama already running locally on 11434.
 #
 # The tunnel opens only when BOTH SSH_TARGET and TUNNEL_PORT are set.
+#
+# NOTE: the tunnel is now opened *lazily by the backend* — only when you enter
+# the "LLM Generation" panel in the UI — not at server startup. start.sh just
+# exports these vars for the backend to rebuild the ssh command. If this file is
+# absent entirely, the LLM panel shows setup instructions instead of connecting.
 
 # --- Remote SSH host (option B). Leave blank for a local Ollama (option A). ---
 SSH_JUMP=""              # optional jump/bastion, e.g. "user@bastion.example.edu"

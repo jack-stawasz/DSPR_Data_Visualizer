@@ -40,11 +40,14 @@ CLI
 """
 
 import argparse
+import atexit
 import json
 import os
 import random
 import shlex
 import subprocess
+import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -430,41 +433,185 @@ def _gpu_status():
             "error": None if gpus else "nvidia-smi reported no GPUs"}
 
 
+# --------------------------------------------------------------------------- #
+# Ollama connection + lazy SSH tunnel
+# --------------------------------------------------------------------------- #
+# The tunnel to a remote Ollama is opened on demand (when the LLM panel calls
+# /api/llm_connect), not at server startup — so a session that never touches
+# LLM generation never opens an SSH connection. start.sh exports the SSH params
+# (SSH_TARGET/SSH_PORT/SSH_JUMP/TUNNEL_PORT) it read from ollama.local.sh; we
+# rebuild the same `ssh -N -L` command here and track the process so atexit can
+# tear it down (replacing start.sh's old cleanup trap).
+_TUNNEL = {"proc": None}
+
+
+def _config_present() -> bool:
+    """True when the user has a local Ollama config (ollama.local.sh)."""
+    return (ROOT / "ollama.local.sh").exists()
+
+
+def _remote_configured() -> bool:
+    """True when a remote Ollama over SSH is configured (mirrors start.sh)."""
+    return bool(os.getenv("SSH_TARGET", "").strip()
+                and os.getenv("TUNNEL_PORT", "").strip())
+
+
+def _probe_ollama(timeout: int = 4) -> dict:
+    """Probe the configured Ollama host's /api/tags.
+
+    Returns {reachable, models, error}; shared by the status and connect flows.
+    """
+    from llm_generate import OLLAMA_HOST
+    try:
+        with urllib.request.urlopen(OLLAMA_HOST.rstrip("/") + "/api/tags",
+                                    timeout=timeout) as resp:
+            data = json.load(resp)
+        return {"reachable": True,
+                "models": [m.get("name", "") for m in data.get("models", [])],
+                "error": None}
+    except Exception as e:  # noqa: BLE001 - any failure means unreachable
+        return {"reachable": False, "models": [],
+                "error": f"Cannot reach Ollama at {OLLAMA_HOST} ({e})"}
+
+
+def _tunnel_running() -> bool:
+    proc = _TUNNEL["proc"]
+    return proc is not None and proc.poll() is None
+
+
+def _open_tunnel() -> None:
+    """Spawn `ssh -N -L <local>:localhost:11434 ...`, tracking the process.
+
+    Mirrors start.sh's tunnel command but without -f, so we keep the handle and
+    can read stderr / kill it on exit. BatchMode + ExitOnForwardFailure make it
+    fail fast (no password prompt to hang on — key-based auth is required).
+    """
+    from llm_generate import OLLAMA_HOST
+    local_port = urllib.parse.urlparse(OLLAMA_HOST).port or 11434
+    cmd = ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "ExitOnForwardFailure=yes"]
+    jump = os.getenv("SSH_JUMP", "").strip()
+    if jump:
+        cmd += ["-J", jump]
+    cmd += ["-L", f"{local_port}:localhost:11434",
+            os.getenv("SSH_TARGET", "").strip(),
+            "-p", os.getenv("SSH_PORT", "22").strip() or "22"]
+    _TUNNEL["proc"] = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+
+
+def _close_tunnel() -> None:
+    proc = _TUNNEL["proc"]
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+
+
+atexit.register(_close_tunnel)
+
+
+def _ensure_connection() -> dict:
+    """Ensure Ollama is reachable, opening the SSH tunnel if needed.
+
+    Returns {reachable, models, error}. Idempotent: a probe that already
+    succeeds (a local Ollama, or a tunnel left from a previous attempt) returns
+    immediately without spawning anything.
+    """
+    probe = _probe_ollama()
+    if probe["reachable"]:
+        return probe
+
+    if not _remote_configured():
+        probe["error"] = (
+            "Ollama is not reachable and no remote host is configured — start a "
+            "local `ollama serve`, or set SSH_TARGET/TUNNEL_PORT in "
+            "ollama.local.sh for a remote host.")
+        return probe
+
+    # Remote: open the tunnel (once) and wait for Ollama to answer through it.
+    if not _tunnel_running():
+        try:
+            _open_tunnel()
+        except FileNotFoundError:
+            return {"reachable": False, "models": [],
+                    "error": "Cannot open SSH tunnel — `ssh` not found on the backend host."}
+
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        proc = _TUNNEL["proc"]
+        if proc is not None and proc.poll() is not None:
+            # ssh exited before/while forwarding — surface its stderr.
+            err = (proc.stderr.read() if proc.stderr else "").strip()
+            _TUNNEL["proc"] = None
+            return {"reachable": False, "models": [],
+                    "error": f"SSH tunnel failed: {err or 'ssh exited unexpectedly'}"}
+        probe = _probe_ollama(timeout=2)
+        if probe["reachable"]:
+            return probe
+        time.sleep(0.7)
+
+    return {"reachable": False, "models": [],
+            "error": ("SSH tunnel opened but Ollama did not respond within 12s — "
+                      "is `ollama serve` running on the remote host?")}
+
+
 def _ollama_status():
     """Reachability + model availability of the configured Ollama host."""
     # Lazy import keeps the env-derived config in one place (llm_generate
     # reads OLLAMA_HOST/OLLAMA_MODEL at import); the module itself imports
     # cleanly even when the ollama package is not installed.
     from llm_generate import DEFAULT_MODEL, OLLAMA_HOST
-    info = {"host": OLLAMA_HOST, "model": DEFAULT_MODEL,
-            "reachable": False, "models": [], "error": None}
-    try:
-        with urllib.request.urlopen(OLLAMA_HOST.rstrip("/") + "/api/tags",
-                                    timeout=4) as resp:
-            data = json.load(resp)
-        info["reachable"] = True
-        info["models"] = [m.get("name", "") for m in data.get("models", [])]
-    except Exception as e:  # noqa: BLE001 - any failure means unreachable
-        info["error"] = (f"Cannot reach Ollama at {OLLAMA_HOST} — is the SSH "
-                         f"tunnel open and `ollama serve` running? ({e})")
-    return info
+    probe = _probe_ollama()
+    error = None if probe["reachable"] else (
+        probe["error"] + " — is the SSH tunnel open and `ollama serve` running?")
+    return {"host": OLLAMA_HOST, "model": DEFAULT_MODEL,
+            "reachable": probe["reachable"], "models": probe["models"],
+            "error": error}
+
+
+def _availability(ollama: dict):
+    """(available, reason) verdict shared by the status and connect routes."""
+    if not ollama["reachable"]:
+        return False, ollama["error"]
+    if not ollama["models"]:
+        return False, "No models are installed on the Ollama host."
+    return True, "LLM generation is ready."
 
 
 @app.route("/api/llm_status")
 def api_llm_status():
-    """Everything the LLM Generation panel needs to decide if it can run."""
+    """Passive readiness re-check (no tunnel opened) for the Refresh button."""
     gpu = _gpu_status()
     ollama = _ollama_status()
-    if not ollama["reachable"]:
-        available, reason = False, ollama["error"]
-    elif ollama["model"] not in ollama["models"]:
-        available, reason = False, (
-            f"Model '{ollama['model']}' is not available on the Ollama host "
-            f"(found: {', '.join(ollama['models']) or 'none'}).")
-    else:
-        available, reason = True, "LLM generation is ready."
+    available, reason = _availability(ollama)
     return jsonify({"ok": True, "gpu": gpu, "ollama": ollama,
                     "available": available, "reason": reason})
+
+
+@app.route("/api/llm_connect", methods=["POST"])
+def api_llm_connect():
+    """Lazily connect to Ollama (opening the SSH tunnel if needed) on demand.
+
+    Called when the user enters the LLM Generation panel. Gated on a local
+    config: without ollama.local.sh we point the user at the example rather than
+    attempting any connection. On success returns the same shape as
+    /api/llm_status plus configured:true.
+    """
+    if not _config_present():
+        return jsonify({
+            "ok": False, "configured": False,
+            "hint_file": "ollama.local.sh.example",
+            "error": ("No ollama.local.sh found — copy ollama.local.sh.example "
+                      "to ollama.local.sh and set your Ollama host."),
+        })
+
+    from llm_generate import DEFAULT_MODEL, OLLAMA_HOST
+    conn = _ensure_connection()
+    ollama = {"host": OLLAMA_HOST, "model": DEFAULT_MODEL,
+              "reachable": conn["reachable"], "models": conn["models"],
+              "error": conn["error"]}
+    available, reason = _availability(ollama)
+    return jsonify({"ok": True, "configured": True, "gpu": _gpu_status(),
+                    "ollama": ollama, "available": available, "reason": reason})
 
 
 def _status_payload(status: str) -> dict:
@@ -618,7 +765,11 @@ def api_llm_generate():
         return jsonify({"ok": False,
                         "error": "ollama not installed — pip install -r requirements.txt"}), 500
     try:
-        result = generate_for_problem(record, auto_verify=bool(body.get("auto_verify")))
+        kwargs = {"auto_verify": bool(body.get("auto_verify"))}
+        model = (body.get("model") or "").strip()
+        if model:  # else generate_for_problem falls back to DEFAULT_MODEL
+            kwargs["model"] = model
+        result = generate_for_problem(record, **kwargs)
     except Exception as e:  # noqa: BLE001 - report to the UI
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify(result)

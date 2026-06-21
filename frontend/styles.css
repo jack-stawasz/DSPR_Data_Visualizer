@@ -251,6 +251,15 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 .dot.ok { background: var(--green); }
 .dot.err { background: var(--red); }
 .dot.warn { background: var(--amber); }
+/* Live "connecting…" indicator: a pulsing amber dot until the attempt resolves. */
+.dot.connecting { background: var(--amber); animation: dot-pulse 1s ease-in-out infinite; }
+@keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+/* Model picker in the LLM controls row. */
+.model-pick {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--muted);
+}
+.model-pick select { font-size: 13px; padding: 4px 8px; }
 .gpu-table {
   font-size: 12px;
   background: #12151b; border: 1px solid var(--border); border-radius: 6px;

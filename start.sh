@@ -19,7 +19,10 @@ TUNNEL_PORT="${TUNNEL_PORT:-}"   # blank = no SSH tunnel
 # GPU_SSH stays unset unless ollama.local.sh exports it -> _gpu_status() then
 # runs nvidia-smi locally (informational only; generation runs on the Ollama host).
 
-# Open the tunnel only when a remote host AND a local forward port are configured.
+# A remote host AND a local forward port together mean "use a tunnel". The
+# backend now opens that tunnel lazily (when the user enters the LLM panel), so
+# here we only export the SSH params for it to rebuild the same ssh command.
+export SSH_JUMP SSH_TARGET SSH_PORT TUNNEL_PORT
 USE_TUNNEL=""
 if [ -n "$SSH_TARGET" ] && [ -n "$TUNNEL_PORT" ]; then
     USE_TUNNEL=1
@@ -88,26 +91,11 @@ fi
 # Avoid the HuggingFace Xet backend, which has hung on this box before.
 export HF_HUB_DISABLE_XET=1
 
-# Point the generator at the remote Ollama via an SSH tunnel, opened here and
-# torn down when this script exits. Skipped entirely when no tunnel is
-# configured (the generator then talks to OLLAMA_HOST directly).
-TUNNEL_PID=""
-cleanup() {
-    if [ -n "$TUNNEL_PID" ]; then
-        printf "\nClosing SSH tunnel (pid %s)...\n" "$TUNNEL_PID"
-        kill "$TUNNEL_PID" 2>/dev/null
-    fi
-}
-trap cleanup EXIT INT TERM
-
+# The SSH tunnel is no longer opened here. The backend opens it lazily — only
+# when the user enters the LLM Generation panel — and tears it down on exit
+# (the pre-clear above already removed any stale tunnel from a previous run).
 if [ -n "$USE_TUNNEL" ]; then
-    printf "Opening SSH tunnel (Ollama on local port %s)..." "$TUNNEL_PORT"
-    ssh -N -f \
-        ${SSH_JUMP:+-J "$SSH_JUMP"} \
-        -L "${TUNNEL_PORT}:localhost:11434" \
-        "$SSH_TARGET" -p "${SSH_PORT:-22}"
-    TUNNEL_PID=$(pgrep -n -f "${TUNNEL_PORT}:localhost:11434")
-    printf " Done (pid %s)\n" "$TUNNEL_PID"
+    printf "Remote Ollama configured (%s) — the tunnel opens when you enter the LLM panel.\n" "$OLLAMA_HOST"
 else
     printf "No SSH tunnel configured — using Ollama at %s\n" "$OLLAMA_HOST"
     printf "  (copy ollama.local.sh.example to ollama.local.sh to use a remote host)\n"

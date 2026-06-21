@@ -426,7 +426,7 @@ function showTab(name) {
     initDatasetBrowser();
     populateBaseSelect();
     loadPending();
-    if (GEN_MODE === "llm") refreshLLMStatus();
+    if (GEN_MODE === "llm") connectAndRefreshLLM();
   }
   try { localStorage.setItem(ACTIVE_TAB_KEY, name); } catch (e) { /* storage disabled */ }
 }
@@ -977,7 +977,7 @@ async function savePerturbation() {
 // --------------------------------------------------------------------------
 const GEN_MODES = [
   { id: "manual", label: "Manual Creation", panel: "modeManual", onEnter() {} },
-  { id: "llm", label: "LLM Generation", panel: "modeLLM", onEnter() { refreshLLMStatus(); } },
+  { id: "llm", label: "LLM Generation", panel: "modeLLM", onEnter() { connectAndRefreshLLM(); } },
 ];
 let GEN_MODE = "manual";
 
@@ -1012,24 +1012,67 @@ function setGenMode(id) {
 let LLM_STATUS = { checked: false, server: false, available: false,
                    reason: "Status not checked yet — open the LLM Generation panel.", data: null };
 
-async function refreshLLMStatus() {
+// Entered the LLM panel (or hit Refresh): lazily connect to Ollama — opening
+// the SSH tunnel on the backend if a remote host is configured — and reflect
+// the outcome. A "connecting…" indicator shows until the attempt resolves.
+async function connectAndRefreshLLM() {
   const body = document.getElementById("llmStatusBody");
-  body.innerHTML = '<div class="hint">Checking status…</div>';
+  body.innerHTML =
+    '<div class="status-line"><span class="dot connecting"></span>' +
+    '<b>Connecting</b><span class="detail">Reaching the Ollama host…</span></div>';
   let data = null;
   try {
-    const res = await fetch("/api/llm_status");
-    if (res.ok) data = await res.json();
+    const res = await fetch("/api/llm_connect", { method: "POST" });
+    data = await res.json();
   } catch (e) { /* fetch failed -> server offline */ }
+
   if (!data) {
     LLM_STATUS = { checked: true, server: false, available: false,
       reason: "Backend server is offline — run start.sh (or python app.py serve).", data: null };
-  } else {
-    BACKEND = true; // a live status response proves the API is up
-    LLM_STATUS = { checked: true, server: true, available: !!data.available,
-      reason: data.reason || "", data };
+    renderLLMStatus();
+    updateLLMControls();
+    return;
   }
+
+  BACKEND = true; // a live response proves the API is up
+
+  // No local config: guide the user to the example rather than pretend to connect.
+  if (data.configured === false) {
+    const hint = escapeHtml(data.hint_file || "ollama.local.sh.example");
+    body.innerHTML =
+      `<div class="hint">${escapeHtml(data.error || "Ollama is not configured.")}` +
+      `<br>Run <code>cp ${hint} ollama.local.sh</code> in the repo root, fill in your ` +
+      `host (or leave the SSH vars blank for a local Ollama), then restart the server.</div>`;
+    LLM_STATUS = { checked: true, server: true, available: false,
+      reason: data.error || "No ollama.local.sh — see the setup note above.", data: null };
+    updateLLMControls();
+    return;
+  }
+
+  LLM_STATUS = { checked: true, server: true, available: !!data.available,
+    reason: data.reason || "", data };
+  populateModelOptions(data.ollama || {});
   renderLLMStatus();
   updateLLMControls();
+}
+
+// Fill #llmModel with the models installed on the Ollama host, preferring the
+// user's last pick, then the backend default, then the first available.
+function populateModelOptions(o) {
+  const sel = document.getElementById("llmModel");
+  const models = o.models || [];
+  if (!models.length) {
+    sel.innerHTML = "<option>—</option>";
+    sel.disabled = true;
+    return;
+  }
+  const saved = localStorage.getItem("llmModel");
+  const preferred = models.includes(saved) ? saved
+                  : (models.includes(o.model) ? o.model : models[0]);
+  sel.innerHTML = models.map(m =>
+    `<option value="${escapeHtml(m)}"${m === preferred ? " selected" : ""}>${escapeHtml(m)}</option>`
+  ).join("");
+  sel.disabled = false;
 }
 
 function dotLine(state, label, detail) {
@@ -1107,7 +1150,11 @@ async function llmGenerate() {
     const res = await fetch("/api/llm_generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ problem_id: r.problem_id, auto_verify: autoVerify }),
+      body: JSON.stringify({
+        problem_id: r.problem_id,
+        auto_verify: autoVerify,
+        model: document.getElementById("llmModel").value || undefined,
+      }),
     });
     const data = await res.json();
     if (!data.ok) { setStatus("saveStatus", "LLM error: " + data.error, "err"); updateLLMControls(); return; }
@@ -1328,7 +1375,10 @@ document.getElementById("dsReload").addEventListener("click", () => {
 });
 document.getElementById("savePerturbation").addEventListener("click", savePerturbation);
 document.getElementById("llmGenerateBtn").addEventListener("click", llmGenerate);
-document.getElementById("llmStatusRefresh").addEventListener("click", refreshLLMStatus);
+document.getElementById("llmStatusRefresh").addEventListener("click", connectAndRefreshLLM);
+document.getElementById("llmModel").addEventListener("change", (e) => {
+  if (e.target.value) localStorage.setItem("llmModel", e.target.value);
+});
 document.getElementById("simpleProblem").addEventListener("input", (e) => {
   autoGrow(e.target);
   renderPreviewInto("simplePreview", e.target.value);
