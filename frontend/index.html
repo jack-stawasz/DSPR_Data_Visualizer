@@ -36,7 +36,10 @@
     <!-- Step 1: Pull problems — browse a dataset source, filter/sort, pull one at a time. -->
     <div id="tabPull" class="ctab">
       <div class="section">
-        <h2 class="step-title">Pull problems</h2>
+        <div class="card-head" style="margin-bottom:4px">
+          <h2 class="step-title" style="margin:0">Pull</h2>
+          <button id="dsReload" type="button" style="margin-left:auto">Refresh</button>
+        </div>
         <p class="hint">Browse a source dataset, filter and sort, then pull individual problems into
           <code class="kbd">data/DSPR_dataset.json</code> (status: Original) &mdash; you author the perturbations in step 2.</p>
 
@@ -51,7 +54,6 @@
             <option value="">Sort: default</option>
           </select>
           <button id="dsClear" type="button">Clear filters</button>
-          <button id="dsReload" type="button">Reload</button>
           <span class="count" id="dsCount"></span>
         </div>
 
@@ -74,6 +76,7 @@
             </div>
             <div class="save-row">
               <button id="dsPull" class="btn-accent" disabled>Pull this problem &rarr;</button>
+              <div class="batch-ctl" id="pullBatch"></div>
               <button id="dsPullAll" type="button" disabled>Pull all selected &rarr;</button>
             </div>
           </div>
@@ -85,7 +88,10 @@
     <!-- Step 2: Author perturbations -->
     <div id="tabCreate" class="ctab">
       <div class="section">
-        <h2 class="step-title">Generate a perturbation</h2>
+        <div class="card-head" style="margin-bottom:4px">
+          <h2 class="step-title" style="margin:0">Generate</h2>
+          <button id="generateRefresh" type="button" style="margin-left:auto">Refresh</button>
+        </div>
         <p class="hint">Pick a base problem (status: Original in <code class="kbd">data/DSPR_dataset.json</code>), then author a
           <b>simple</b> and <b>hard</b> variant manually or generate them with an LLM.
           Saving adds them with status Unverified for review in step 3.</p>
@@ -93,7 +99,6 @@
         <div class="subnav" id="genModeNav"></div>
         <div class="status" id="generateStatus"></div>
         <div class="field">
-          <label>Base problem</label>
           <div class="pv-nav">
             <button id="basePrev" type="button">&larr; Prev</button>
             <span id="baseIndicator" class="nav-indicator">&mdash;</span>
@@ -160,19 +165,15 @@
           <div id="modeLLM" class="gen-mode hidden">
             <div class="llm-status-head">
               <h3>LLM generation status</h3>
-              <button id="llmStatusRefresh" type="button">Refresh status</button>
             </div>
             <div id="llmStatusBody">
               <div class="hint">Status not checked yet.</div>
             </div>
             <div id="llmAvailability" class="llm-banner err">Status not checked yet.</div>
             <div class="save-row">
-              <label class="model-pick" title="Choose which model installed on the Ollama host to generate with">
-                Model
-                <select id="llmModel" disabled><option>—</option></select>
-              </label>
               <button id="llmGenerateBtn" class="btn-accent" disabled
                 title="Generate simple + hard perturbations for this problem with the selected model">LLM Generation</button>
+              <div class="batch-ctl" id="genBatch"></div>
               <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
                 <input type="checkbox" id="llmAutoVerify" /> Auto-verify
                 <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>
@@ -189,7 +190,7 @@
     <div id="tabVerify" class="ctab">
       <div class="section">
         <div class="card-head" style="margin-bottom:4px">
-          <h2 class="step-title" style="margin:0">Verify perturbations</h2>
+          <h2 class="step-title" style="margin:0">Verify</h2>
           <button id="refreshPending" style="margin-left:auto">Refresh</button>
         </div>
         <p class="hint">Review each problem's perturbations from <code class="kbd">data/DSPR_dataset.json</code> (status: Unverified).
@@ -212,6 +213,10 @@
               <button id="verifyJumpGo" type="button">Go</button>
             </span>
           </div>
+        </div>
+        <div class="field" style="margin-bottom:14px">
+          <label>Batch operation</label>
+          <div class="batch-ctl" id="verifyBatch"></div>
         </div>
         <div id="verifyList"></div>
       </div>

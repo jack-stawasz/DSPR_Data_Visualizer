@@ -204,8 +204,23 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 .field textarea { resize: vertical; min-height: 70px; line-height: 1.5; }
 /* auto-growing editors: expand to fit content instead of scrolling */
 .field textarea.autogrow { resize: none; overflow: hidden; }
-.save-row { display: flex; align-items: center; gap: 16px; margin-top: 16px; }
+.save-row { display: flex; align-items: center; gap: 16px; margin-top: 16px; flex-wrap: wrap; }
 .save-row .toggle { cursor: pointer; }
+
+/* Shared batch-operation controls (Pull / Generate / Verify): a type dropdown,
+   an optional size/percentage input, and an Ordered/Random mode toggle. The
+   same markup is built by createBatchControl() for every section. */
+.batch-ctl { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.batch-ctl select, .batch-ctl .batch-num {
+  background: var(--card2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px;
+}
+.batch-ctl .batch-num { width: 64px; }
+.batch-ctl .batch-pct { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+.batch-ctl .batch-mode { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.batch-ctl .batch-mode-btn { border: 0; border-radius: 0; padding: 6px 10px; font-size: 12px; }
+.batch-ctl .batch-mode-btn.active { background: var(--accent); color: #fff; }
+.batch-ctl [hidden] { display: none !important; }
 .info {
   cursor: help; display: inline-flex; align-items: center; justify-content: center;
   width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--muted);
@@ -254,27 +269,36 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 /* Live "connecting…" indicator: a pulsing amber dot until the attempt resolves. */
 .dot.connecting { background: var(--amber); animation: dot-pulse 1s ease-in-out infinite; }
 @keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
-/* Model picker in the LLM controls row. */
-.model-pick {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 13px; color: var(--muted);
+/* GPU (read-only) + model (selectable) columns. */
+.llm-cols { display: flex; gap: 12px; align-items: flex-start; margin: 8px 0; }
+.llm-col { flex: 1 1 0; min-width: 0; }
+.col-head {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); margin: 0 0 6px 2px;
 }
-.model-pick select { font-size: 13px; padding: 4px 8px; }
-.gpu-table {
-  font-size: 12px;
-  background: #12151b; border: 1px solid var(--border); border-radius: 6px;
-  margin: 6px 0; overflow: hidden;
+.pick-card {
+  display: block;                        /* model cards stack name over meta */
+  background: var(--card2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 12px; margin-bottom: 6px; cursor: pointer; text-align: left;
+  transition: border-color .12s, box-shadow .12s, background .12s;
 }
-.gpu-row {
-  display: flex; align-items: center; gap: 14px;
-  padding: 8px 12px; border-top: 1px solid var(--border);
+.pick-card.static { display: flex; align-items: center; gap: 14px; cursor: default; }
+.pick-card:not(.static):hover { border-color: #3a4150; }
+.pick-card.selected {
+  border-color: var(--accent);
+  background: #283041;                   /* slightly brightened module background */
+  box-shadow: 0 0 0 1px var(--accent), 0 0 10px rgba(79,156,255,.55);
 }
-.gpu-row:first-child { border-top: none; }
+/* "will be used" tag on the GPU the shared scheduler is predicted to pick. */
+.gpu-target {
+  margin-left: auto; flex: none; font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .04em; color: var(--accent);
+}
 .gpu-idx {
   font-weight: 700; font-size: 16px; white-space: nowrap;
   min-width: 64px; color: var(--text);
 }
-.gpu-stats { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.gpu-stats { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-size: 12px; }
 .gpu-free { font-weight: 600; white-space: nowrap; }
 .gpu-free.ok { color: var(--green); }
 .gpu-free.warn { color: var(--amber); }
@@ -283,13 +307,18 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
   font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
   font-size: 11px;
 }
-.gpu-table .muted { color: var(--muted); font-weight: 400; }
+.pick-card .muted { color: var(--muted); font-weight: 400; }
+.model-name { font-weight: 600; font-size: 13px; word-break: break-word; }
+.model-meta { font-size: 12px; margin-top: 2px; }
 .llm-banner {
   margin-top: 10px; font-size: 13px; padding: 8px 12px;
   border-radius: 6px; border: 1px solid var(--border);
 }
 .llm-banner.ok { color: var(--green); border-color: rgba(63,185,80,.4); }
 .llm-banner.err { color: var(--red); border-color: rgba(248,81,73,.4); }
+/* HuggingFace dataset link — a lighter blue than --accent for visibility. */
+.ds-desc a { color: #82bbff; text-decoration: underline; }
+.ds-desc a:hover { color: #a9d2ff; }
 
 /* --------------------------------------------------------------------- */
 /* Dataset browser (Pull section). Source tabs + a Projects-style filter   */

@@ -47,3 +47,9 @@ export OLLAMA_HOST="http://localhost:11434"
 # (or skip it). For option B, mirror your SSH args, e.g.:
 #   export GPU_SSH="-J $SSH_JUMP -p $SSH_PORT $SSH_TARGET"
 export GPU_SSH=""
+
+# --- GPU selection. ---
+# The LLM panel's GPU column is informational only. Where Ollama runs as a
+# shared, root-owned system service it auto-schedules GPUs and can't be pinned
+# per request, so the panel just highlights the GPU it's most likely to use (the
+# most-free card). GPU_SSH above is all that's needed (for the nvidia-smi readout).

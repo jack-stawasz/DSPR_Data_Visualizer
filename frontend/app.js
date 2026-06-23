@@ -312,6 +312,145 @@ function wireJump(jumpId, goId, getTotal, onJump) {
   });
 }
 
+// --------------------------------------------------------------------------
+// Shared batch operations — one implementation reused by the Pull, Generate,
+// and Verify sections. Each section supplies a small descriptor (its eligible
+// list, the current item, and a per-item action); everything else — the type
+// dropdown, the size/percentage inputs, the Ordered/Random toggle, the
+// selection maths, and the run loop — lives here so the behaviour is identical
+// everywhere and adding it to a new section is just a descriptor + one host.
+//
+//   BatchConfig = { type: "single"|"size"|"percentage", count, percent,
+//                   mode: "ordered"|"random" }
+//   Section     = { status, batch, getEligible(), getCurrent(),
+//                   runOne(item, opts), afterBatch(summary, opts), onProgress? }
+// --------------------------------------------------------------------------
+
+// Build the batch controls into a host element and return a { getConfig } handle.
+// opts.onChange (optional) fires whenever any control changes so a section can
+// refresh its action button label/state.
+function createBatchControl(hostId, opts) {
+  opts = opts || {};
+  const host = document.getElementById(hostId);
+  if (!host) return { getConfig: () => ({ type: "single", count: 1, percent: 0, mode: "ordered" }) };
+  host.innerHTML = `
+    <select class="batch-type" aria-label="Batch type">
+      <option value="single">Single</option>
+      <option value="size">Batch Size</option>
+      <option value="percentage">Percentage</option>
+    </select>
+    <input type="number" class="batch-num batch-size-input" min="1" step="1"
+           value="${opts.defaultSize || 5}" aria-label="Number of problems" hidden />
+    <span class="batch-pct" hidden><input type="number" class="batch-num batch-pct-input"
+           min="1" max="100" step="1" value="${opts.defaultPct || 25}" aria-label="Percentage of problems" />%</span>
+    <span class="batch-mode" role="group" aria-label="Selection mode" hidden>
+      <button type="button" class="batch-mode-btn active" data-mode="ordered">Ordered</button>
+      <button type="button" class="batch-mode-btn" data-mode="random">Random</button>
+    </span>`;
+  const typeSel = host.querySelector(".batch-type");
+  const sizeInput = host.querySelector(".batch-size-input");
+  const pctWrap = host.querySelector(".batch-pct");
+  const pctInput = host.querySelector(".batch-pct-input");
+  const modeWrap = host.querySelector(".batch-mode");
+  let mode = "ordered";
+  const fireChange = () => { if (opts.onChange) opts.onChange(); };
+  function sync() {
+    const t = typeSel.value;
+    sizeInput.hidden = t !== "size";
+    pctWrap.hidden = t !== "percentage";
+    modeWrap.hidden = t === "single";   // mode is meaningless for a single item
+  }
+  typeSel.addEventListener("change", () => { sync(); fireChange(); });
+  sizeInput.addEventListener("input", fireChange);
+  pctInput.addEventListener("input", fireChange);
+  modeWrap.querySelectorAll(".batch-mode-btn").forEach(b =>
+    b.addEventListener("click", () => {
+      mode = b.dataset.mode;
+      modeWrap.querySelectorAll(".batch-mode-btn").forEach(x => x.classList.toggle("active", x === b));
+      fireChange();
+    }));
+  sync();
+  return {
+    getConfig() {
+      return {
+        type: typeSel.value,
+        count: parseInt(sizeInput.value, 10) || 0,
+        percent: parseFloat(pctInput.value) || 0,
+        mode,
+      };
+    },
+  };
+}
+
+// How many items a config asks for, given the eligible pool size.
+function batchCount(config, total) {
+  if (!total) return 0;
+  if (config.type === "single") return 1;
+  if (config.type === "size") return Math.max(0, Math.min(total, Math.floor(config.count || 0)));
+  if (config.type === "percentage") {
+    const pct = Math.max(0, Math.min(100, config.percent || 0));
+    let n = Math.round((pct / 100) * total);    // 40% of 20 → 8
+    if (pct > 0 && n === 0) n = 1;              // a non-zero % always picks ≥1
+    return Math.min(total, n);
+  }
+  return 0;
+}
+
+// Pick n distinct items from arr at random (partial Fisher–Yates).
+function sampleN(arr, n) {
+  const a = arr.slice();
+  const take = Math.min(n, a.length);
+  for (let i = 0; i < take; i++) {
+    const j = i + Math.floor(Math.random() * (a.length - i));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a.slice(0, take);
+}
+
+// Resolve a config into the concrete list of items to operate on. Eligibility is
+// the caller's responsibility (eligible is already status-scoped); this only
+// decides which of those eligible items the batch touches.
+//   single      → just the current item (only if it is itself eligible)
+//   ordered     → start at current and walk forward, wrapping with modulo
+//   random      → a random distinct sample
+function selectBatchItems(eligible, current, config) {
+  const total = eligible.length;
+  const n = batchCount(config, total);
+  if (n <= 0) return [];
+  if (config.type === "single") {
+    return eligible.indexOf(current) >= 0 ? [current] : [];
+  }
+  if (config.mode === "random") return sampleN(eligible, n);
+  let start = eligible.indexOf(current);
+  if (start < 0) start = 0;                      // no current selection → from the top
+  const out = [];
+  for (let k = 0; k < n; k++) out.push(eligible[(start + k) % total]);
+  return out;
+}
+
+// Run a section's action across its batch selection: read the config, resolve
+// the items, apply runOne to each in turn (reporting progress), then hand the
+// section a single afterBatch so it refreshes its UI/state once.
+async function runBatch(section, opts) {
+  opts = opts || {};
+  const config = section.batch.getConfig();
+  const eligible = section.getEligible();
+  const items = selectBatchItems(eligible, section.getCurrent(), config);
+  if (!items.length) {
+    setStatus(section.status, opts.emptyMsg || "No eligible problems to operate on.", "err");
+    return { ok: 0, fail: 0, total: 0 };
+  }
+  let ok = 0, fail = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (section.onProgress) section.onProgress(i + 1, items.length);
+    const res = await section.runOne(items[i], opts);
+    if (res && res.ok) ok++; else fail++;
+  }
+  const summary = { ok, fail, total: items.length };
+  if (section.afterBatch) await section.afterBatch(summary, opts);
+  return summary;
+}
+
 function variantBlock(tag, obj) {
   if (!obj) return "";
   const problem = obj.problem ?? "";
@@ -476,7 +615,7 @@ async function populateBaseSelect() {
       setStatus("generateStatus",
         "No original problems found — pull some problems first.", "err");
     } else {
-      setStatus("generateStatus", `${RAW_RECORDS.length} pulled problem(s) available.`, "ok");
+      setStatus("generateStatus", "", "");  // count is redundant with the nav indicator
     }
   } catch (e) {
     setStatus("generateStatus", "Failed to load raw problems: " + e.message, "err");
@@ -488,9 +627,9 @@ async function populateBaseSelect() {
 
 // Refresh the shared nav indicator + Prev/Next state, then re-render the viewer.
 function updateBaseNav() {
-  const r = currentBase();
+  // No ID in the generate-section indicator (omit the id arg); other sections keep it.
   updateNav({ prev: "basePrev", next: "baseNext", indicator: "baseIndicator", jump: "baseJump" },
-            BASE_IDX, RAW_RECORDS.length, r ? (r.problem_id ?? "") : "");
+            BASE_IDX, RAW_RECORDS.length);
   onBaseChange();
 }
 
@@ -540,9 +679,13 @@ function rawRecordToModel(rec) {
 // Render the shared display for the current base problem (does NOT touch the
 // simple/hard editors, so it is safe to call on author-name keystrokes).
 function renderGenDisplay() {
+  const host = document.getElementById("genDisplay");
+  // The LLM Generation mode generates from the selected base directly, so the
+  // original-problem viewer is hidden there to reduce clutter.
+  if (GEN_MODE === "llm") { host.innerHTML = ""; return; }
   const r = currentBase();
   if (!r) {
-    document.getElementById("genDisplay").innerHTML =
+    host.innerHTML =
       '<div class="hint">No base problem available — pull some in the Pull section first.</div>';
     return;
   }
@@ -832,7 +975,6 @@ function renderDatasetCurrent() {
   const total = DS.cache[DS.current] ? DS.cache[DS.current].records.length : 0;
   document.getElementById("dsCount").textContent = `${DS.filtered.length} / ${total} match`;
   const viewer = document.getElementById("dsViewer");
-  const pullBtn = document.getElementById("dsPull");
   const rec = currentDatasetRecord();
   updateNav({ prev: "dsPrev", next: "dsNext", indicator: "dsIndicator", jump: "dsJump" },
             DS.idx, DS.filtered.length, "");
@@ -843,45 +985,67 @@ function renderDatasetCurrent() {
   pullAllBtn.textContent = pending ? `Pull all selected (${pending}) →` : "Pull all selected →";
   if (!rec) {
     viewer.innerHTML = '<div class="empty">No problems match your filters.</div>';
-    pullBtn.disabled = true;
-    pullBtn.textContent = "Pull this problem →";
-    return;
+  } else {
+    renderProblemDisplay(viewer, datasetRecordToModel(rec));
   }
-  renderProblemDisplay(viewer, datasetRecordToModel(rec));
-  pullBtn.disabled = !!rec.pulled;
-  pullBtn.textContent = rec.pulled ? "Already pulled ✓" : "Pull this problem →";
+  updatePullButton();
 }
 
-async function pullDatasetRecord() {
-  const rec = currentDatasetRecord();
-  if (!rec) return;
-  const pullBtn = document.getElementById("dsPull");
-  pullBtn.disabled = true;
-  pullBtn.textContent = "Pulling…";
-  try {
-    const res = await fetch("/api/pull_record", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dataset: DS.current, record: rec }),
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      setStatus("pullStatus", "Pull failed: " + data.error, "err");
+// Pull section batch descriptor. Eligible = filtered records not yet pulled;
+// the per-item action posts one record to /api/pull_record. The shared runBatch
+// drives Single / Batch Size / Percentage and Ordered / Random off this.
+const pullSection = {
+  status: "pullStatus",
+  batch: null,   // createBatchControl handle, set during init
+  getEligible: () => DS.filtered.filter(r => !r.pulled),
+  getCurrent: () => currentDatasetRecord(),
+  async runOne(rec) {
+    try {
+      const res = await fetch("/api/pull_record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dataset: DS.current, record: rec }),
+      });
+      const data = await res.json();
+      if (data.ok) { rec.pulled = true; return { ok: true }; }
+      // A duplicate is already in the store — treat it as pulled, count as a skip.
       if (data.error && data.error.includes("duplicate")) rec.pulled = true;
-      renderDatasetCurrent();
-      return;
+      return { ok: false, error: data.error };
+    } catch (e) {
+      return { ok: false, error: e.message };
     }
-    rec.pulled = true;
+  },
+  onProgress(i, total) {
+    if (total > 1) setStatus("pullStatus", `Pulling ${i} / ${total}…`, "");
+  },
+  async afterBatch({ ok, fail }) {
+    const label = currentDataset() ? currentDataset().label : DS.current;
     setStatus("pullStatus",
-      `Pulled problem ${data.record.problem_id} from ${currentDataset().label} → ${data.file}.`, "ok");
+      `Pulled ${ok} problem(s) from ${label}` + (fail ? `, ${fail} failed/skipped.` : "."),
+      fail ? "err" : "ok");
     renderDatasetCurrent();
-    // Keep the Browse view and the Generate base list in sync.
+    // Keep the Browse view and the Generate base list in sync (once, after the batch).
     await refreshBrowse();
     populateBaseSelect();
-  } catch (e) {
-    setStatus("pullStatus", "Request failed: " + e.message, "err");
-    renderDatasetCurrent();
+  },
+};
+
+// Enable/label the Pull button from the current batch config: in single mode it
+// mirrors the focused record's pulled state; in batch modes it reflects how many
+// eligible records the selection would touch.
+function updatePullButton() {
+  const btn = document.getElementById("dsPull");
+  if (!btn || !pullSection.batch) return;
+  const cfg = pullSection.batch.getConfig();
+  const rec = currentDatasetRecord();
+  if (cfg.type === "single") {
+    btn.disabled = !rec || !!rec.pulled;
+    btn.textContent = rec && rec.pulled ? "Already pulled ✓" : "Pull this problem →";
+    return;
   }
+  const n = selectBatchItems(pullSection.getEligible(), rec, cfg).length;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `Pull ${n} selected →` : "Pull selected →";
 }
 
 // Pull every record passing the current filters/search that isn't already pulled.
@@ -1003,7 +1167,15 @@ function setGenMode(id) {
   }
   document.querySelectorAll("#genModeNav button").forEach(b =>
     b.classList.toggle("active", b.dataset.mode === mode.id));
+  renderGenDisplay();  // reflect the mode (original viewer hidden in LLM mode)
   mode.onEnter();
+}
+
+// Top-right Refresh for the Generate section: re-read pulled problems in Manual
+// mode, or reconnect/refresh Ollama in LLM mode.
+function refreshGenerateSection() {
+  if (GEN_MODE === "llm") connectAndRefreshLLM();
+  else populateBaseSelect();
 }
 
 // --------------------------------------------------------------------------
@@ -1011,6 +1183,10 @@ function setGenMode(id) {
 // --------------------------------------------------------------------------
 let LLM_STATUS = { checked: false, server: false, available: false,
                    reason: "Status not checked yet — open the LLM Generation panel.", data: null };
+// Model selection is the only interactive pick (seeded from last session). The
+// GPU column is informational — the shared host auto-schedules — so we just
+// highlight the GPU it's most likely to use; that's derived at render time.
+let SELECTED_MODEL = localStorage.getItem("llmModel"); // full model name or null
 
 // Entered the LLM panel (or hit Refresh): lazily connect to Ollama — opening
 // the SSH tunnel on the backend if a remote host is configured — and reflect
@@ -1051,28 +1227,25 @@ async function connectAndRefreshLLM() {
 
   LLM_STATUS = { checked: true, server: true, available: !!data.available,
     reason: data.reason || "", data };
-  populateModelOptions(data.ollama || {});
+  seedModelSelection(data.ollama || {});
   renderLLMStatus();
   updateLLMControls();
 }
 
-// Fill #llmModel with the models installed on the Ollama host, preferring the
-// user's last pick, then the backend default, then the first available.
-function populateModelOptions(o) {
-  const sel = document.getElementById("llmModel");
-  const models = o.models || [];
-  if (!models.length) {
-    sel.innerHTML = "<option>—</option>";
-    sel.disabled = true;
-    return;
+// Seed/repair the singleton selections after a status refresh: keep the user's
+// pick if still present, else default to the saved pick or the first available.
+function seedModelSelection(o) {
+  const models = (o && o.model_info) || [];
+  if (!models.some(m => m.full === SELECTED_MODEL)) {
+    SELECTED_MODEL = models.length ? models[0].full : null;
   }
-  const saved = localStorage.getItem("llmModel");
-  const preferred = models.includes(saved) ? saved
-                  : (models.includes(o.model) ? o.model : models[0]);
-  sel.innerHTML = models.map(m =>
-    `<option value="${escapeHtml(m)}"${m === preferred ? " selected" : ""}>${escapeHtml(m)}</option>`
-  ).join("");
-  sel.disabled = false;
+}
+
+// The GPU the shared Ollama scheduler is most likely to place the model on:
+// the most-free card, tie-broken to the lowest index (matches observed behavior).
+function predictedGpuIndex(gpus) {
+  if (!gpus.length) return null;
+  return gpus.reduce((a, b) => (b.mem_free_mib > a.mem_free_mib ? b : a)).index;
 }
 
 function dotLine(state, label, detail) {
@@ -1086,23 +1259,39 @@ function fmtGiB(mib) { return (mib / GIB).toFixed(1) + " GiB"; }
 // qwen2.5:7b needs ~5 GiB; flag GPUs that lack comfortable headroom for it.
 const FREE_OK_MIB = 8 * GIB;
 
-// GPU readout led by free VRAM (the stat that matters for picking a card on a
-// shared box). Numbers come pre-parsed (MiB) from /api/llm_status. Free VRAM
-// and the used/total fraction each get their own row.
-function renderGpuTable(gpus) {
-  const rows = gpus.map((x) => {
+// GPU column: a read-only readout led by free VRAM (the stat that matters on a
+// shared box). The host auto-schedules, so this is NOT user-selectable — we just
+// glow the card the scheduler is most likely to use and tag it "will be used".
+function renderGpuColumn(gpus) {
+  if (!gpus.length) return '<div class="hint">No GPU detected.</div>';
+  const target = predictedGpuIndex(gpus);
+  return gpus.map((x) => {
     const freeClass = x.mem_free_mib >= FREE_OK_MIB ? "ok" : "warn";
     const pctFree = Math.round((x.mem_free_mib / x.mem_total_mib) * 100);
-    return `<div class="gpu-row">
+    const isTarget = x.index === target;
+    return `<div class="pick-card static${isTarget ? " selected" : ""}">
       <div class="gpu-idx">GPU ${x.index}</div>
       <div class="gpu-stats">
         <div class="gpu-free ${freeClass}">${fmtGiB(x.mem_free_mib)} free <span class="muted">(${pctFree}%)</span></div>
         <div class="gpu-frac muted">${fmtGiB(x.mem_used_mib)} / ${fmtGiB(x.mem_total_mib)} used</div>
         <div class="gpu-name muted">${escapeHtml(x.name)}</div>
       </div>
+      ${isTarget ? '<div class="gpu-target">will be used</div>' : ""}
     </div>`;
-  });
-  return `<div class="gpu-table">${rows.join("")}</div>`;
+  }).join("");
+}
+
+// Model column: one selectable card per installed model, showing name, version,
+// and parameter size ("?" when the host couldn't report it).
+function renderModelColumn(modelInfo) {
+  if (!modelInfo.length) return '<div class="hint">No models installed.</div>';
+  return modelInfo.map((m) => {
+    const sel = m.full === SELECTED_MODEL ? " selected" : "";
+    return `<div class="pick-card${sel}" data-model="${escapeHtml(m.full)}">
+      <div class="model-name">${escapeHtml(m.name)}</div>
+      <div class="model-meta muted">${escapeHtml(m.version)} · ${escapeHtml(m.parameter_size)} parameters</div>
+    </div>`;
+  }).join("");
 }
 
 function renderLLMStatus() {
@@ -1113,13 +1302,26 @@ function renderLLMStatus() {
   if (d) {
     const o = d.ollama || {};
     rows.push(dotLine(o.reachable ? "ok" : "err", "LLM service",
-      o.reachable ? `Ollama reachable at ${o.host} (model: ${o.model})`
+      o.reachable ? `Ollama reachable at ${o.host}`
                   : (o.error || "Unreachable")));
     const g = d.gpu || {};
     rows.push(dotLine(g.detected ? "ok" : "warn", "GPU",
       g.detected ? `${g.gpus.length} GPU(s) on the Ollama host`
                  : (g.error || "No GPU detected")));
-    if (g.detected) rows.push(renderGpuTable(g.gpus));
+    // Two selectable columns (GPU left, models right) once Ollama is reachable.
+    if (o.reachable) {
+      rows.push(
+        `<div class="llm-cols">
+           <div class="llm-col">
+             <div class="col-head">GPU — auto-selected (most free)</div>
+             ${renderGpuColumn((g && g.gpus) || [])}
+           </div>
+           <div class="llm-col">
+             <div class="col-head">Model — pick one to generate with</div>
+             ${renderModelColumn(o.model_info || [])}
+           </div>
+         </div>`);
+    }
   }
   document.getElementById("llmStatusBody").innerHTML = rows.join("");
 }
@@ -1129,8 +1331,9 @@ function renderLLMStatus() {
 function updateLLMControls() {
   let reason = "";
   if (!BACKEND) reason = "Backend not detected — start app.py to enable LLM generation.";
-  else if (!LLM_STATUS.checked) reason = "Status not checked yet — click Refresh status.";
+  else if (!LLM_STATUS.checked) reason = "Status not checked yet — click Refresh.";
   else if (!LLM_STATUS.available) reason = LLM_STATUS.reason;
+  else if (!SELECTED_MODEL) reason = "Select a model from the column above.";
   else if (!currentBase()) reason = "No base problem selected — pull problems in the Pull section first.";
   document.getElementById("llmGenerateBtn").disabled = !!reason;
   const banner = document.getElementById("llmAvailability");
@@ -1138,31 +1341,61 @@ function updateLLMControls() {
   banner.className = "llm-banner " + (reason ? "err" : "ok");
 }
 
+// Generate section batch descriptor — LLM generation. Eligible = the Original
+// base pool (RAW_RECORDS); the per-item action posts to /api/llm_generate and
+// drops the record from the base pool once it leaves "Original" status. (Manual
+// authoring stays single-only below — the same hand-written text can't sensibly
+// be applied to many problems, so only the LLM action is batchable.)
+const genSection = {
+  status: "saveStatus",
+  batch: null,
+  getEligible: () => RAW_RECORDS,
+  getCurrent: () => currentBase(),
+  async runOne(rec, opts) {
+    try {
+      const res = await fetch("/api/llm_generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          problem_id: rec.problem_id,
+          auto_verify: !!opts.autoVerify,
+          model: SELECTED_MODEL || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) return { ok: false, error: data.error };
+      // The record now carries perturbations and has left "Original" status, so
+      // it drops out of the base pool (mirrors advanceAfterSave for one record).
+      CONSUMED_PIDS.add(rec.problem_id);
+      RAW_RECORDS = RAW_RECORDS.filter(r => r.problem_id !== rec.problem_id);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  },
+  onProgress(i, total) {
+    setStatus("saveStatus",
+      total > 1 ? `Generating ${i} / ${total}…`
+                : "Asking the LLM to generate simple + hard variants…", "");
+  },
+  async afterBatch({ ok, fail }, opts) {
+    if (BASE_IDX >= RAW_RECORDS.length) BASE_IDX = RAW_RECORDS.length - 1;
+    updateBaseNav();  // re-renders the base preview for the new current record
+    const dest = opts.autoVerify ? "Verified" : "Unverified";
+    setStatus("saveStatus",
+      `Generated ${ok} → ${dest}` + (fail ? `, ${fail} failed.` : ".") +
+      ` ${RAW_RECORDS.length} problem(s) remaining.`, fail ? "err" : "ok");
+    await refreshBrowse();
+    updateLLMControls();
+  },
+};
+
 async function llmGenerate() {
   if (!BACKEND) { setStatus("saveStatus", "Backend not detected — see the Pull section note.", "err"); return; }
-  const r = currentBase();
-  if (!r) { setStatus("saveStatus", "Select a base problem first (use Prev/Next).", "err"); return; }
+  if (!currentBase()) { setStatus("saveStatus", "Select a base problem first (use Prev/Next).", "err"); return; }
   const autoVerify = document.getElementById("llmAutoVerify").checked;
-  const btn = document.getElementById("llmGenerateBtn");
-  btn.disabled = true;
-  setStatus("saveStatus", "Asking the LLM to generate simple + hard variants…", "");
-  try {
-    const res = await fetch("/api/llm_generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        problem_id: r.problem_id,
-        auto_verify: autoVerify,
-        model: document.getElementById("llmModel").value || undefined,
-      }),
-    });
-    const data = await res.json();
-    if (!data.ok) { setStatus("saveStatus", "LLM error: " + data.error, "err"); updateLLMControls(); return; }
-    // Advance, exactly like a manual save.
-    await advanceAfterSave(r.problem_id, autoVerify);
-  } catch (e) {
-    setStatus("saveStatus", "Request failed: " + e.message, "err");
-  }
+  document.getElementById("llmGenerateBtn").disabled = true;
+  await runBatch(genSection, { autoVerify, emptyMsg: "No base problems available to generate." });
   updateLLMControls();
 }
 
@@ -1304,43 +1537,66 @@ function renderCurrentPending() {
     variantsEl.innerHTML = pendingVariantBlock("simple", rec.simple) + pendingVariantBlock("hard", rec.hard);
     typesetMath(variantsEl);
   }
-  list.querySelector(".verifyApprove").addEventListener("click", () => decidePending("verify"));
-  list.querySelector(".verifyReject").addEventListener("click", () => decidePending("reject"));
+  list.querySelector(".verifyApprove").addEventListener("click", () => runVerifyBatch("verify"));
+  list.querySelector(".verifyReject").addEventListener("click", () => runVerifyBatch("reject"));
 }
 
-async function decidePending(action) {
-  // Act on the whole problem, keyed by problem_id.
-  const rec = PENDING_GROUPS[VERIFY_IDX];
-  if (!rec || rec.problem_id == null) return;
-  if (action === "verify") {
-    const author = document.getElementById("verifyAuthor").value.trim();
-    if (!author) {
-      setStatus("verifyStatus", "⚠ Verifier name is required before approving.", "err");
-      return;
+// Verify section batch descriptor. Eligible = the pending pool (PENDING_GROUPS);
+// the per-item action posts to /api/verify or /api/reject (chosen by the button
+// pressed). The whole original/simple/hard bundle is decided together per record.
+const verifySection = {
+  status: "verifyStatus",
+  batch: null,
+  getEligible: () => PENDING_GROUPS,
+  getCurrent: () => (VERIFY_IDX >= 0 && VERIFY_IDX < PENDING_GROUPS.length ? PENDING_GROUPS[VERIFY_IDX] : null),
+  async runOne(rec, opts) {
+    if (!rec || rec.problem_id == null) return { ok: false, error: "missing problem_id" };
+    try {
+      const res = await fetch("/api/" + opts.action, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ problem_id: rec.problem_id, verify_author: opts.verifyAuthor || "" }),
+      });
+      const data = await res.json();
+      if (!data.ok) return { ok: false, error: data.error };
+      const i = PENDING_GROUPS.indexOf(rec);
+      if (i >= 0) PENDING_GROUPS.splice(i, 1);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
     }
-  }
-  const verifyAuthor = document.getElementById("verifyAuthor").value.trim();
-  try {
-    const res = await fetch("/api/" + action, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ problem_id: rec.problem_id, verify_author: verifyAuthor }),
-    });
-    const data = await res.json();
-    if (!data.ok) { setStatus("verifyStatus", "Error: " + data.error, "err"); return; }
-    // Decided — drop the record and advance.
-    PENDING_GROUPS.splice(VERIFY_IDX, 1);
-    // Stay on the same index (now the next problem); clamp to the new end.
+  },
+  onProgress(i, total) {
+    if (total > 1) setStatus("verifyStatus", `Processing ${i} / ${total}…`, "");
+  },
+  async afterBatch({ ok, fail }, opts) {
+    // Stay on the same index (now the next pending problem); clamp to the new end.
     if (VERIFY_IDX >= PENDING_GROUPS.length) VERIFY_IDX = PENDING_GROUPS.length - 1;
-    setStatus("verifyStatus",
-      action === "verify" ? "Pair marked Verified in DSPR_dataset.json." : "Pair rejected — base problem returned to the Generate pool.", "ok");
     updateVerifyNav();
-    // Approve adds a Verified pair to Browse; Reject restores an Original base —
+    const verb = opts.action === "verify" ? "Verified" : "Rejected";
+    const tail = opts.action === "verify"
+      ? "marked Verified in DSPR_dataset.json."
+      : "rejected — base problem(s) returned to the Generate pool.";
+    setStatus("verifyStatus",
+      `${verb} ${ok} pair(s)` + (fail ? `, ${fail} failed.` : "") + ` — ${tail}`, fail ? "err" : "ok");
+    // Approve adds Verified pairs to Browse; Reject restores Original bases —
     // both change the Browse data set.
     await refreshBrowse();
-  } catch (e) {
-    setStatus("verifyStatus", "Request failed: " + e.message, "err");
+  },
+};
+
+// Approve or reject the batch selection (the button pressed picks the action;
+// the batch control picks how many). Verifier name is required to approve.
+async function runVerifyBatch(action) {
+  const verifyAuthor = document.getElementById("verifyAuthor").value.trim();
+  if (action === "verify" && !verifyAuthor) {
+    setStatus("verifyStatus", "⚠ Verifier name is required before approving.", "err");
+    return;
   }
+  await runBatch(verifySection, {
+    action, verifyAuthor,
+    emptyMsg: action === "verify" ? "Nothing pending to approve." : "Nothing pending to reject.",
+  });
 }
 
 document.getElementById("navBrowse").addEventListener("click", () => showTab("browse"));
@@ -1353,8 +1609,13 @@ document.getElementById("verifyPrev").addEventListener("click", () => stepVerify
 document.getElementById("verifyNext").addEventListener("click", () => stepVerify(1));
 document.getElementById("dsPrev").addEventListener("click", () => stepDataset(-1));
 document.getElementById("dsNext").addEventListener("click", () => stepDataset(1));
-document.getElementById("dsPull").addEventListener("click", pullDatasetRecord);
+document.getElementById("dsPull").addEventListener("click", () =>
+  runBatch(pullSection, { emptyMsg: "Nothing to pull — every matching problem is already pulled." }));
 document.getElementById("dsPullAll").addEventListener("click", pullAllFiltered);
+// Build the shared batch controls for each section (hosts exist in index.html).
+pullSection.batch = createBatchControl("pullBatch", { onChange: updatePullButton });
+genSection.batch = createBatchControl("genBatch");
+verifySection.batch = createBatchControl("verifyBatch");
 wireJump("baseJump", "baseJumpGo", () => RAW_RECORDS.length,
   (i) => { BASE_IDX = i; updateBaseNav(); });
 wireJump("verifyJump", "verifyJumpGo", () => PENDING_GROUPS.length,
@@ -1375,9 +1636,16 @@ document.getElementById("dsReload").addEventListener("click", () => {
 });
 document.getElementById("savePerturbation").addEventListener("click", savePerturbation);
 document.getElementById("llmGenerateBtn").addEventListener("click", llmGenerate);
-document.getElementById("llmStatusRefresh").addEventListener("click", connectAndRefreshLLM);
-document.getElementById("llmModel").addEventListener("change", (e) => {
-  if (e.target.value) localStorage.setItem("llmModel", e.target.value);
+document.getElementById("generateRefresh").addEventListener("click", refreshGenerateSection);
+// Model selection (delegated — cards are re-rendered). GPU cards are static.
+document.getElementById("llmStatusBody").addEventListener("click", (e) => {
+  const card = e.target.closest(".pick-card[data-model]");
+  if (!card) return;
+  SELECTED_MODEL = card.dataset.model;
+  localStorage.setItem("llmModel", SELECTED_MODEL);
+  document.getElementById("llmStatusBody")
+    .querySelectorAll(".pick-card[data-model]").forEach(c => c.classList.toggle("selected", c === card));
+  updateLLMControls();
 });
 document.getElementById("simpleProblem").addEventListener("input", (e) => {
   autoGrow(e.target);

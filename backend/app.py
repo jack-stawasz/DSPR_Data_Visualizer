@@ -44,6 +44,7 @@ import atexit
 import json
 import os
 import random
+import re
 import shlex
 import subprocess
 import time
@@ -456,21 +457,43 @@ def _remote_configured() -> bool:
                 and os.getenv("TUNNEL_PORT", "").strip())
 
 
+def _parse_param_size(name: str):
+    """Best-effort parameter size from a model name/tag: 'qwen2.5:7b' -> '7B'."""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([bBmM])", name or "")
+    return f"{m.group(1)}{m.group(2).upper()}" if m else None
+
+
+def _model_info(entry: dict) -> dict:
+    """Map one /api/tags entry to {full, name, version, parameter_size}.
+
+    parameter_size prefers the reliable details.parameter_size, falls back to a
+    string parse of the tag/name, and is "?" when neither yields anything.
+    """
+    full = entry.get("name", "")
+    base, _, tag = full.partition(":")
+    details = entry.get("details") or {}
+    psize = details.get("parameter_size") or _parse_param_size(tag or full) or "?"
+    return {"full": full, "name": base or full,
+            "version": tag or "latest", "parameter_size": psize}
+
+
 def _probe_ollama(timeout: int = 4) -> dict:
     """Probe the configured Ollama host's /api/tags.
 
-    Returns {reachable, models, error}; shared by the status and connect flows.
+    Returns {reachable, models, model_info, error}; shared by status + connect.
     """
     from llm_generate import OLLAMA_HOST
     try:
         with urllib.request.urlopen(OLLAMA_HOST.rstrip("/") + "/api/tags",
                                     timeout=timeout) as resp:
             data = json.load(resp)
+        entries = data.get("models", [])
         return {"reachable": True,
-                "models": [m.get("name", "") for m in data.get("models", [])],
+                "models": [m.get("name", "") for m in entries],
+                "model_info": [_model_info(m) for m in entries],
                 "error": None}
     except Exception as e:  # noqa: BLE001 - any failure means unreachable
-        return {"reachable": False, "models": [],
+        return {"reachable": False, "models": [], "model_info": [],
                 "error": f"Cannot reach Ollama at {OLLAMA_HOST} ({e})"}
 
 
@@ -507,6 +530,12 @@ def _close_tunnel() -> None:
 
 
 atexit.register(_close_tunnel)
+
+
+# Note: the LLM panel's GPU column is informational. On the target host Ollama
+# runs as a shared, root-owned system service that auto-schedules GPUs and can't
+# be pinned per request, so the frontend only *highlights* the GPU the scheduler
+# is most likely to use (the most-free card) rather than selecting one.
 
 
 def _ensure_connection() -> dict:
@@ -565,7 +594,7 @@ def _ollama_status():
         probe["error"] + " — is the SSH tunnel open and `ollama serve` running?")
     return {"host": OLLAMA_HOST, "model": DEFAULT_MODEL,
             "reachable": probe["reachable"], "models": probe["models"],
-            "error": error}
+            "model_info": probe.get("model_info", []), "error": error}
 
 
 def _availability(ollama: dict):
@@ -608,7 +637,7 @@ def api_llm_connect():
     conn = _ensure_connection()
     ollama = {"host": OLLAMA_HOST, "model": DEFAULT_MODEL,
               "reachable": conn["reachable"], "models": conn["models"],
-              "error": conn["error"]}
+              "model_info": conn.get("model_info", []), "error": conn["error"]}
     available, reason = _availability(ollama)
     return jsonify({"ok": True, "configured": True, "gpu": _gpu_status(),
                     "ollama": ollama, "available": available, "reason": reason})
