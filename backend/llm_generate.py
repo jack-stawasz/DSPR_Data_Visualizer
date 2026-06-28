@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 
 # Reuse the pipeline's file-I/O + record helpers and path constants so the
@@ -171,7 +172,10 @@ def generate_variants(client, record: dict, model: str) -> dict:
     if not text:
         raise RuntimeError("Ollama returned no text content to parse.")
     try:
-        data = json.loads(text)
+        # Ollama's SDK already decoded the JSON once; re-encoding lone backslashes
+        # prevents \frac → form-feed + "rac" when json.loads runs a second time.
+        text_fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+        data = json.loads(text_fixed)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Could not parse Ollama's JSON response: {e}\n{text[:300]}") from e
 

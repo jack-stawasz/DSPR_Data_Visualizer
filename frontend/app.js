@@ -168,6 +168,19 @@ function renderMathField(raw) {
   return html;
 }
 
+// A perturbation's answer comes back as a *bare* LaTeX expression (e.g.
+// "\frac{1}{2}" or "\left[ \frac{\pi^2}{8}, \frac{5\pi^2}{4} \right]") with no
+// $ or \( \) delimiters, so KaTeX auto-render would leave it as raw source.
+// Wrap a bare, math-looking answer in $...$ so it typesets; leave answers that
+// already carry their own delimiters (or are plain prose) to renderMathField.
+function renderAnswerField(raw) {
+  const s = String(raw).trim();
+  if (!s) return "";
+  const hasDelims = /\$|\\\(|\\\[|\\begin\{/.test(s);
+  const looksLikeMath = /[\\^_{}=+\-*/]|\d/.test(s);
+  return hasDelims || !looksLikeMath ? renderMathField(s) : `$${escapeHtml(s)}$`;
+}
+
 // Run KaTeX auto-render on an element (pre/code tags ignored by default, so asy is safe).
 function typesetMath(el) {
   if (typeof renderMathInElement !== "function") {
@@ -248,7 +261,7 @@ function renderProblemDisplay(container, model, opts) {
   const answer = model.answer
     ? `<div class="pv-answer">
          <div class="preview-label">Answer / Solution</div>
-         <div class="preview answer-text">${renderMathField(String(model.answer))}</div>
+         <div class="preview answer-text">${renderAnswerField(String(model.answer))}</div>
        </div>` : "";
   let pert = "";
   if (opts.perturbations) {
@@ -320,64 +333,101 @@ function wireJump(jumpId, goId, getTotal, onJump) {
 // selection maths, and the run loop — lives here so the behaviour is identical
 // everywhere and adding it to a new section is just a descriptor + one host.
 //
-//   BatchConfig = { type: "single"|"size"|"percentage", count, percent,
-//                   mode: "ordered"|"random" }
+//   BatchConfig = { count, mode: "ordered"|"random" }
 //   Section     = { status, batch, getEligible(), getCurrent(),
 //                   runOne(item, opts), afterBatch(summary, opts), onProgress? }
+//
+// The count input and the percentage slider are two views of one quantity: the
+// number of eligible problems to operate on. Editing either updates the other,
+// both clamped against the live pool size (opts.getTotal). The count is reset to
+// the max available when set too high, to 0 when negative, and rounded to a whole
+// number; the slider snaps the count to the matching percentage of the pool.
 // --------------------------------------------------------------------------
 
-// Build the batch controls into a host element and return a { getConfig } handle.
-// opts.onChange (optional) fires whenever any control changes so a section can
-// refresh its action button label/state.
+// Build the batch controls into a host element and return a { getConfig, refresh }
+// handle. opts.getTotal() supplies the current eligible-pool size; opts.onChange
+// (optional) fires whenever any control changes so a section can refresh its
+// action button label/state.
 function createBatchControl(hostId, opts) {
   opts = opts || {};
   const host = document.getElementById(hostId);
-  if (!host) return { getConfig: () => ({ type: "single", count: 1, percent: 0, mode: "ordered" }) };
+  if (!host) return { getConfig: () => ({ count: 0, mode: "ordered" }), refresh: () => {} };
   host.innerHTML = `
-    <select class="batch-type" aria-label="Batch type">
-      <option value="single">Single</option>
-      <option value="size">Batch Size</option>
-      <option value="percentage">Percentage</option>
-    </select>
-    <input type="number" class="batch-num batch-size-input" min="1" step="1"
-           value="${opts.defaultSize || 5}" aria-label="Number of problems" hidden />
-    <span class="batch-pct" hidden><input type="number" class="batch-num batch-pct-input"
-           min="1" max="100" step="1" value="${opts.defaultPct || 25}" aria-label="Percentage of problems" />%</span>
-    <span class="batch-mode" role="group" aria-label="Selection mode" hidden>
+    <label class="batch-count">
+      <input type="number" class="batch-num batch-count-input" min="0" step="1"
+             value="${opts.defaultCount || 1}" aria-label="Number of problems" />
+      <span class="batch-unit">problems</span>
+    </label>
+    <span class="batch-slider-wrap">
+      <input type="range" class="batch-slider" min="0" max="100" step="1" value="0"
+             aria-label="Percentage of problems" />
+      <span class="batch-pct-readout">0%</span>
+    </span>
+    <span class="batch-mode" role="group" aria-label="Selection mode">
       <button type="button" class="batch-mode-btn active" data-mode="ordered">Ordered</button>
       <button type="button" class="batch-mode-btn" data-mode="random">Random</button>
     </span>`;
-  const typeSel = host.querySelector(".batch-type");
-  const sizeInput = host.querySelector(".batch-size-input");
-  const pctWrap = host.querySelector(".batch-pct");
-  const pctInput = host.querySelector(".batch-pct-input");
+  const countInput = host.querySelector(".batch-count-input");
+  const slider = host.querySelector(".batch-slider");
+  const pctReadout = host.querySelector(".batch-pct-readout");
   const modeWrap = host.querySelector(".batch-mode");
   let mode = "ordered";
+  let count = Math.max(0, Math.round(opts.defaultCount || 1));   // source of truth
+  const total = () => Math.max(0, opts.getTotal ? opts.getTotal() : 0);
   const fireChange = () => { if (opts.onChange) opts.onChange(); };
-  function sync() {
-    const t = typeSel.value;
-    sizeInput.hidden = t !== "size";
-    pctWrap.hidden = t !== "percentage";
-    modeWrap.hidden = t === "single";   // mode is meaningless for a single item
+
+  // Mirror the current count onto the slider + readout (count input optionally,
+  // so a user mid-keystroke isn't fought). Percentage is count / pool size.
+  function reflect(rewriteCount) {
+    const max = total();
+    if (rewriteCount) countInput.value = String(count);
+    const pct = max ? Math.round((count / max) * 100) : 0;
+    slider.value = String(pct);
+    pctReadout.textContent = pct + "%";
   }
-  typeSel.addEventListener("change", () => { sync(); fireChange(); });
-  sizeInput.addEventListener("input", fireChange);
-  pctInput.addEventListener("input", fireChange);
+
+  // Count edited: round floats, floor negatives at 0, cap at the pool size.
+  function commitCount(rewriteCount) {
+    const max = total();
+    let n = Math.round(Number(countInput.value));
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    if (n > max) n = max;
+    count = n;
+    reflect(rewriteCount);
+    fireChange();
+  }
+
+  // Slider moved: count becomes that percentage of the live pool size.
+  function commitPct() {
+    const max = total();
+    const pct = Math.max(0, Math.min(100, Math.round(Number(slider.value) || 0)));
+    count = Math.round((pct / 100) * max);
+    countInput.value = String(count);
+    pctReadout.textContent = pct + "%";
+    fireChange();
+  }
+
+  countInput.addEventListener("input", () => commitCount(false));  // live, keep text
+  countInput.addEventListener("change", () => commitCount(true));  // normalize on blur
+  slider.addEventListener("input", commitPct);
   modeWrap.querySelectorAll(".batch-mode-btn").forEach(b =>
     b.addEventListener("click", () => {
       mode = b.dataset.mode;
       modeWrap.querySelectorAll(".batch-mode-btn").forEach(x => x.classList.toggle("active", x === b));
       fireChange();
     }));
-  sync();
+  reflect(true);
   return {
     getConfig() {
-      return {
-        type: typeSel.value,
-        count: parseInt(sizeInput.value, 10) || 0,
-        percent: parseFloat(pctInput.value) || 0,
-        mode,
-      };
+      return { count: Math.max(0, Math.min(total(), count)), mode };
+    },
+    // Re-sync the display when the pool size changes underneath us (records
+    // pulled/generated/verified). Clamp the count down to a shrunken pool, but
+    // never invent a larger count than the user asked for.
+    refresh() {
+      const max = total();
+      if (count > max) count = max;
+      reflect(true);
     },
   };
 }
@@ -385,15 +435,7 @@ function createBatchControl(hostId, opts) {
 // How many items a config asks for, given the eligible pool size.
 function batchCount(config, total) {
   if (!total) return 0;
-  if (config.type === "single") return 1;
-  if (config.type === "size") return Math.max(0, Math.min(total, Math.floor(config.count || 0)));
-  if (config.type === "percentage") {
-    const pct = Math.max(0, Math.min(100, config.percent || 0));
-    let n = Math.round((pct / 100) * total);    // 40% of 20 → 8
-    if (pct > 0 && n === 0) n = 1;              // a non-zero % always picks ≥1
-    return Math.min(total, n);
-  }
-  return 0;
+  return Math.max(0, Math.min(total, Math.floor(config.count || 0)));
 }
 
 // Pick n distinct items from arr at random (partial Fisher–Yates).
@@ -410,16 +452,12 @@ function sampleN(arr, n) {
 // Resolve a config into the concrete list of items to operate on. Eligibility is
 // the caller's responsibility (eligible is already status-scoped); this only
 // decides which of those eligible items the batch touches.
-//   single      → just the current item (only if it is itself eligible)
 //   ordered     → start at current and walk forward, wrapping with modulo
 //   random      → a random distinct sample
 function selectBatchItems(eligible, current, config) {
   const total = eligible.length;
   const n = batchCount(config, total);
   if (n <= 0) return [];
-  if (config.type === "single") {
-    return eligible.indexOf(current) >= 0 ? [current] : [];
-  }
   if (config.mode === "random") return sampleN(eligible, n);
   let start = eligible.indexOf(current);
   if (start < 0) start = 0;                      // no current selection → from the top
@@ -427,6 +465,28 @@ function selectBatchItems(eligible, current, config) {
   for (let k = 0; k < n; k++) out.push(eligible[(start + k) % total]);
   return out;
 }
+
+// Shared batch progress bar (Generate / Pull). ids = { wrap, bar } of the track
+// and fill element ids. setBatchProgress reveals the bar and fills it to the
+// fraction completed before step i of total; finishBatchProgress flashes it to
+// 100% then hides+resets it. A single-item run shows an empty bar that flashes
+// full, matching the multi-item behaviour.
+function setBatchProgress(ids, i, total) {
+  const wrap = document.getElementById(ids.wrap);
+  const bar = document.getElementById(ids.bar);
+  if (!wrap || !bar) return;
+  wrap.classList.remove("hidden");
+  bar.style.width = (total > 1 ? ((i - 1) / total) * 100 : 0) + "%";
+}
+function finishBatchProgress(ids) {
+  const wrap = document.getElementById(ids.wrap);
+  const bar = document.getElementById(ids.bar);
+  if (!wrap || !bar) return;
+  bar.style.width = "100%";
+  setTimeout(() => { wrap.classList.add("hidden"); bar.style.width = "0%"; }, 400);
+}
+const GEN_PROGRESS = { wrap: "genProgressWrap", bar: "genProgressBar" };
+const PULL_PROGRESS = { wrap: "pullProgressWrap", bar: "pullProgressBar" };
 
 // Run a section's action across its batch selection: read the config, resolve
 // the items, apply runOne to each in turn (reporting progress), then hand the
@@ -630,6 +690,7 @@ function updateBaseNav() {
   // No ID in the generate-section indicator (omit the id arg); other sections keep it.
   updateNav({ prev: "basePrev", next: "baseNext", indicator: "baseIndicator", jump: "baseJump" },
             BASE_IDX, RAW_RECORDS.length);
+  if (genSection.batch) genSection.batch.refresh();  // track the base pool size
   onBaseChange();
 }
 
@@ -978,11 +1039,6 @@ function renderDatasetCurrent() {
   const rec = currentDatasetRecord();
   updateNav({ prev: "dsPrev", next: "dsNext", indicator: "dsIndicator", jump: "dsJump" },
             DS.idx, DS.filtered.length, "");
-  // "Pull all selected" acts on every filtered record not already pulled.
-  const pending = DS.filtered.filter(r => !r.pulled).length;
-  const pullAllBtn = document.getElementById("dsPullAll");
-  pullAllBtn.disabled = pending === 0;
-  pullAllBtn.textContent = pending ? `Pull all selected (${pending}) →` : "Pull all selected →";
   if (!rec) {
     viewer.innerHTML = '<div class="empty">No problems match your filters.</div>';
   } else {
@@ -1017,8 +1073,10 @@ const pullSection = {
   },
   onProgress(i, total) {
     if (total > 1) setStatus("pullStatus", `Pulling ${i} / ${total}…`, "");
+    setBatchProgress(PULL_PROGRESS, i, total);
   },
   async afterBatch({ ok, fail }) {
+    finishBatchProgress(PULL_PROGRESS);
     const label = currentDataset() ? currentDataset().label : DS.current;
     setStatus("pullStatus",
       `Pulled ${ok} problem(s) from ${label}` + (fail ? `, ${fail} failed/skipped.` : "."),
@@ -1030,58 +1088,17 @@ const pullSection = {
   },
 };
 
-// Enable/label the Pull button from the current batch config: in single mode it
-// mirrors the focused record's pulled state; in batch modes it reflects how many
-// eligible records the selection would touch.
+// Enable/label the Pull button from the current batch config: it reflects how
+// many eligible records the count/slider selection would touch.
 function updatePullButton() {
   const btn = document.getElementById("dsPull");
   if (!btn || !pullSection.batch) return;
+  pullSection.batch.refresh();   // re-sync count/slider against the filtered pool
   const cfg = pullSection.batch.getConfig();
   const rec = currentDatasetRecord();
-  if (cfg.type === "single") {
-    btn.disabled = !rec || !!rec.pulled;
-    btn.textContent = rec && rec.pulled ? "Already pulled ✓" : "Pull this problem →";
-    return;
-  }
   const n = selectBatchItems(pullSection.getEligible(), rec, cfg).length;
   btn.disabled = n === 0;
   btn.textContent = n ? `Pull ${n} selected →` : "Pull selected →";
-}
-
-// Pull every record passing the current filters/search that isn't already pulled.
-// Works off a snapshot so the set is stable even though each pull flips r.pulled.
-async function pullAllFiltered() {
-  const targets = DS.filtered.filter(r => !r.pulled);
-  if (!targets.length) return;
-  const pullBtn = document.getElementById("dsPull");
-  const pullAllBtn = document.getElementById("dsPullAll");
-  pullBtn.disabled = true;
-  pullAllBtn.disabled = true;
-  let pulled = 0, failed = 0;
-  for (let i = 0; i < targets.length; i++) {
-    const rec = targets[i];
-    pullAllBtn.textContent = `Pulling ${i + 1} / ${targets.length}…`;
-    try {
-      const res = await fetch("/api/pull_record", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dataset: DS.current, record: rec }),
-      });
-      const data = await res.json();
-      if (data.ok) { rec.pulled = true; pulled++; }
-      else { if (data.error && data.error.includes("duplicate")) rec.pulled = true; failed++; }
-    } catch (e) {
-      failed++;
-    }
-  }
-  const label = currentDataset() ? currentDataset().label : DS.current;
-  setStatus("pullStatus",
-    `Pulled ${pulled} problem(s) from ${label}` + (failed ? `, ${failed} failed/skipped.` : "."),
-    failed ? "err" : "ok");
-  renderDatasetCurrent();
-  // Keep the Browse view and the Generate base list in sync (once, after the batch).
-  await refreshBrowse();
-  populateBaseSelect();
 }
 
 async function savePerturbation() {
@@ -1377,8 +1394,10 @@ const genSection = {
     setStatus("saveStatus",
       total > 1 ? `Generating ${i} / ${total}…`
                 : "Asking the LLM to generate simple + hard variants…", "");
+    setBatchProgress(GEN_PROGRESS, i, total);
   },
   async afterBatch({ ok, fail }, opts) {
+    finishBatchProgress(GEN_PROGRESS);
     if (BASE_IDX >= RAW_RECORDS.length) BASE_IDX = RAW_RECORDS.length - 1;
     updateBaseNav();  // re-renders the base preview for the new current record
     const dest = opts.autoVerify ? "Verified" : "Unverified";
@@ -1463,6 +1482,7 @@ function updateVerifyNav() {
   const cur = (VERIFY_IDX >= 0 && PENDING_GROUPS[VERIFY_IDX]) ? PENDING_GROUPS[VERIFY_IDX] : null;
   updateNav({ prev: "verifyPrev", next: "verifyNext", indicator: "verifyIndicator", jump: "verifyJump" },
             VERIFY_IDX, PENDING_GROUPS.length, cur ? (cur.problem_id ?? "") : "");
+  if (verifySection.batch) verifySection.batch.refresh();  // track the pending pool size
   renderCurrentPending();
 }
 
@@ -1483,7 +1503,7 @@ function pendingVariantBlock(tag, obj) {
       ${obj.answer ? `
         <div class="answer-wrap">
           <div class="answer-label">Answer</div>
-          <div class="answer-text">${renderMathField(obj.answer)}</div>
+          <div class="answer-text">${renderAnswerField(obj.answer)}</div>
         </div>` : ""}
     </div>`;
 }
@@ -1513,12 +1533,17 @@ function pendingGroupToModel(rec) {
 
 // Render the record at VERIFY_IDX through the shared Problem Viewer, then fill
 // the perturbations section. The original/simple/hard variants form one bundle
-// that is approved or rejected together, so there is a single action row for
-// the whole problem rather than per-variant buttons.
+// approved or rejected together by the shared Approve/Reject action row (static
+// in index.html, alongside the batch control — mirroring the Pull/Generate
+// sections); here we only toggle that row's enabled state.
 function renderCurrentPending() {
   const list = document.getElementById("verifyList");
+  const approve = document.getElementById("verifyApprove");
+  const reject = document.getElementById("verifyReject");
   if (VERIFY_IDX < 0 || !PENDING_GROUPS.length) {
     list.innerHTML = '<div class="empty">Nothing awaiting verification.</div>';
+    if (approve) approve.disabled = true;
+    if (reject) reject.disabled = true;
     return;
   }
   const rec = PENDING_GROUPS[VERIFY_IDX];
@@ -1526,10 +1551,6 @@ function renderCurrentPending() {
     <div class="card">
       <div class="pv-host" id="verifyDisplay"></div>
       <div class="variant-row" id="verifyVariants"></div>
-      <div class="loader-row verify-actions" style="margin-top:14px">
-        <button class="btn-accent verifyApprove">Approve pair &rarr; verified</button>
-        <button class="verifyReject">Reject pair</button>
-      </div>
     </div>`;
   renderProblemDisplay("verifyDisplay", pendingGroupToModel(rec));
   const variantsEl = list.querySelector("#verifyVariants");
@@ -1537,8 +1558,8 @@ function renderCurrentPending() {
     variantsEl.innerHTML = pendingVariantBlock("simple", rec.simple) + pendingVariantBlock("hard", rec.hard);
     typesetMath(variantsEl);
   }
-  list.querySelector(".verifyApprove").addEventListener("click", () => runVerifyBatch("verify"));
-  list.querySelector(".verifyReject").addEventListener("click", () => runVerifyBatch("reject"));
+  if (approve) approve.disabled = false;
+  if (reject) reject.disabled = false;
 }
 
 // Verify section batch descriptor. Eligible = the pending pool (PENDING_GROUPS);
@@ -1607,15 +1628,19 @@ document.getElementById("basePrev").addEventListener("click", () => stepBase(-1)
 document.getElementById("baseNext").addEventListener("click", () => stepBase(1));
 document.getElementById("verifyPrev").addEventListener("click", () => stepVerify(-1));
 document.getElementById("verifyNext").addEventListener("click", () => stepVerify(1));
+document.getElementById("verifyApprove").addEventListener("click", () => runVerifyBatch("verify"));
+document.getElementById("verifyReject").addEventListener("click", () => runVerifyBatch("reject"));
 document.getElementById("dsPrev").addEventListener("click", () => stepDataset(-1));
 document.getElementById("dsNext").addEventListener("click", () => stepDataset(1));
 document.getElementById("dsPull").addEventListener("click", () =>
   runBatch(pullSection, { emptyMsg: "Nothing to pull — every matching problem is already pulled." }));
-document.getElementById("dsPullAll").addEventListener("click", pullAllFiltered);
 // Build the shared batch controls for each section (hosts exist in index.html).
-pullSection.batch = createBatchControl("pullBatch", { onChange: updatePullButton });
-genSection.batch = createBatchControl("genBatch");
-verifySection.batch = createBatchControl("verifyBatch");
+pullSection.batch = createBatchControl("pullBatch",
+  { onChange: updatePullButton, getTotal: () => pullSection.getEligible().length });
+genSection.batch = createBatchControl("genBatch",
+  { getTotal: () => genSection.getEligible().length });
+verifySection.batch = createBatchControl("verifyBatch",
+  { getTotal: () => verifySection.getEligible().length });
 wireJump("baseJump", "baseJumpGo", () => RAW_RECORDS.length,
   (i) => { BASE_IDX = i; updateBaseNav(); });
 wireJump("verifyJump", "verifyJumpGo", () => PENDING_GROUPS.length,

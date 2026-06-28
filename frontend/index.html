@@ -77,9 +77,11 @@
             <div class="save-row">
               <button id="dsPull" class="btn-accent" disabled>Pull this problem &rarr;</button>
               <div class="batch-ctl" id="pullBatch"></div>
-              <button id="dsPullAll" type="button" disabled>Pull all selected &rarr;</button>
             </div>
           </div>
+        </div>
+        <div class="gen-progress-wrap hidden" id="pullProgressWrap">
+          <div class="gen-progress-bar" id="pullProgressBar"></div>
         </div>
         <div class="status" id="pullStatus"></div>
       </div>
@@ -181,6 +183,9 @@
             </div>
           </div>
 
+          <div class="gen-progress-wrap hidden" id="genProgressWrap">
+            <div class="gen-progress-bar" id="genProgressBar"></div>
+          </div>
           <div class="status" id="saveStatus"></div>
         </div>
       </div>
@@ -214,11 +219,12 @@
             </span>
           </div>
         </div>
-        <div class="field" style="margin-bottom:14px">
-          <label>Batch operation</label>
+        <div id="verifyList"></div>
+        <div class="save-row">
+          <button id="verifyApprove" class="btn-accent" disabled>Approve pair &rarr; verified</button>
+          <button id="verifyReject" disabled>Reject pair</button>
           <div class="batch-ctl" id="verifyBatch"></div>
         </div>
-        <div id="verifyList"></div>
       </div>
     </div>
   </div>
