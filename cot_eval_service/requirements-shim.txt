@@ -1,0 +1,8 @@
+# Extra deps for the eval shim, on top of the CoTSimilarity repo's own
+# requirements.txt (which already provides vllm, litellm, networkx, torch, …).
+# Install into the same environment as the repo:
+#     pip install -r cot_eval_service/requirements-shim.txt
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# answer_norm.py's radical/scalar equivalence fallback (tuple rescue works without it)
+sympy>=1.12

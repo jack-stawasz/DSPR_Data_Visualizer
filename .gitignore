@@ -2,11 +2,19 @@
 # Copy ollama.local.sh.example -> ollama.local.sh and fill it in.
 ollama.local.sh
 
+# Personal CoT-eval GED config (holds a real Gemini API key) — never committed.
+# Copy cot_eval.local.sh.example -> cot_eval.local.sh and fill it in.
+cot_eval.local.sh
+
 # Disposable local virtualenv (rebuilt by start.sh from requirements.txt).
 venv/
 
 # Python bytecode caches.
 __pycache__/
+
+# Throwaway one-off scripts/logs/data dumps (underscore-prefixed convention).
+backend/_*
+_pilot_pulled.json
 
 # Local Claude Code config and project guidance (machine-specific, not shared).
 .claude/

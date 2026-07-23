@@ -10,6 +10,7 @@
   --amber: #d29922;
   --red: #f85149;
   --border: #2c313a;
+  --header-h: 90px; /* kept in sync with the sticky header's real height by syncHeaderHeight() in app.js */
 }
 * { box-sizing: border-box; }
 body {
@@ -59,6 +60,10 @@ button {
 button:hover { background: #2c313a; }
 .count { color: var(--muted); font-size: 13px; margin-left: auto; }
 main { padding: 20px 24px 60px; max-width: 1000px; margin: 0 auto; }
+/* Browse's facet sidebar (.ds-filters, 220px + 16px gap) sits to the left of
+   the card list — widen main only for that view so the cards keep their
+   normal ~1000px column instead of being squeezed by the sidebar. */
+main.wide { max-width: 1240px; }
 .card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -89,6 +94,21 @@ main { padding: 20px 24px 60px; max-width: 1000px; margin: 0 auto; }
 .badge.verifier { color: #22d3ee; border-color: rgba(34,211,238,.4); }
 .badge.source   { color: #2dd4bf; border-color: rgba(45,212,191,.4); }
 .badge.aug      { color: var(--muted); border-color: var(--border); background: var(--card2); }
+/* CoTSimilarity evaluation badges + action row. */
+.badge.eval      { color: var(--accent); border-color: rgba(79,156,255,.4); background: var(--card2); }
+.badge.eval.ok   { color: var(--green); border-color: rgba(46,160,67,.45); }
+.badge.eval.warn { color: var(--amber); border-color: rgba(210,153,34,.45); }
+.badge.eval.err  { color: var(--red);   border-color: rgba(248,81,73,.45); }
+.badge.eval.na   { color: var(--muted); border-color: var(--border); background: var(--card2); }
+/* Filter-step disposition tags. */
+.badge.kept     { color: var(--green); border-color: rgba(46,160,67,.45); }
+.badge.rejected { color: var(--red);   border-color: rgba(248,81,73,.45); }
+/* Grader crashed on a trial (distinct from a genuine low solve-%) — hover the
+   tag for the exception message. */
+.badge.grader-err { color: var(--red); border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.1); }
+.eval-row { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; flex-wrap: wrap; }
+.eval-row .status { margin-top: 0; }
+.eval-badge { display: inline-flex; align-items: center; }
 .variants { display: flex; flex-direction: column; gap: 10px; }
 .variant {
   background: var(--card2);
@@ -160,7 +180,24 @@ details.asy pre {
 .subnav button { font-weight: 600; }
 .subnav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .ctab.hidden { display: none; }
-label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; color: var(--text); }
+label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; color: var(--text); cursor: pointer; }
+/* Pill-style toggle switch, themed off the same site variables as every other
+   control, so it stays in sync if the theme palette changes. */
+.switch-input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch-track {
+  position: relative; flex: none; display: inline-block;
+  width: 34px; height: 20px;
+  background: var(--card2); border: 1px solid var(--border); border-radius: 999px;
+  transition: background .15s, border-color .15s;
+}
+.switch-thumb {
+  position: absolute; top: 1px; left: 1px; width: 16px; height: 16px;
+  background: var(--muted); border-radius: 50%;
+  transition: transform .15s, background .15s;
+}
+.switch-input:checked + .switch-track { background: var(--accent); border-color: var(--accent); }
+.switch-input:checked + .switch-track .switch-thumb { transform: translateX(14px); background: #fff; }
+.switch-input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Shared navigation model (Pull / Generate / Verify): Prev/Next + indicator
    + jump-to-index, placed in the same relative position in every section. */
 .pv-nav { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -327,6 +364,14 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
   background: var(--accent);
   transition: width 0.25s ease;
 }
+/* Pull-step eval phase: two labelled bars (problems + sampling trials). */
+.eval-progress { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.eval-progress.hidden { display: none; }
+.eval-progress-row { display: grid; grid-template-columns: 120px 1fr; align-items: center; gap: 10px; }
+.eval-progress-label { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.eval-progress-row .gen-progress-wrap { margin-top: 0; }
+/* The trial bar steps discretely; keep its fill snappy rather than eased. */
+#pullEvalTrialBar { transition: width 0.1s linear; }
 .llm-banner {
   margin-top: 10px; font-size: 13px; padding: 8px 12px;
   border-radius: 6px; border: 1px solid var(--border);
@@ -356,11 +401,15 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 
 /* Two-column layout: filter rail + focused problem viewer. */
 .ds-layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: start; }
+/* Pull has no filter rail (facets moved to the Filter step) — single column. */
+.ds-layout.single { grid-template-columns: 1fr; }
 @media (max-width: 760px) { .ds-layout { grid-template-columns: 1fr; } }
 .ds-main { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
 
 .ds-filters {
-  position: sticky; top: 90px;
+  position: sticky; top: calc(var(--header-h) + 12px);
+  max-height: calc(100vh - var(--header-h) - 24px);
+  overflow-y: auto;
   background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -368,7 +417,19 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 }
 .ds-fpanel-title {
   font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
-  color: var(--muted); font-weight: 700; margin-bottom: 10px;
+  color: var(--muted); font-weight: 700;
+}
+/* Filters rail header row (title + Clear) and the min-solve-% slider. */
+.ds-fhead-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.ds-fclear { font-size: 12px; padding: 3px 9px; }
+.ds-fcount-line { margin-bottom: 12px; }
+.ds-fcount-line .count { font-size: 12px; color: var(--muted); }
+.ds-filters .ds-sort { width: 100%; }
+.ds-filters .batch-slider-wrap { display: flex; align-items: center; gap: 8px; }
+.ds-filters .batch-slider { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.ds-filters .batch-pct-readout {
+  font-size: 12px; color: var(--muted); min-width: 34px; text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .ds-fgroup { margin-bottom: 14px; }
 .ds-fgroup:last-child { margin-bottom: 0; }
@@ -409,3 +470,15 @@ label.toggle { display: flex; gap: 7px; align-items: center; font-size: 13px; co
 }
 .pv-pert-body { margin-top: 10px; }
 .pv-pert-body:empty { margin-top: 0; }
+.pv-debug-sample {
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  background: #12151b; margin-bottom: 12px;
+}
+.pv-debug-sample > summary {
+  cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.pv-debug-sample .preview {
+  margin-top: 10px; white-space: pre-wrap; font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+}

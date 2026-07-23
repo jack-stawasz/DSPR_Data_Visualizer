@@ -1,0 +1,34 @@
+#!/bin/bash
+# ─── Personal CoT-eval GED config (TEMPLATE) ──────────────────────────────────
+# Copy this file to `cot_eval.local.sh`:
+#
+#     cp cot_eval.local.sh.example cot_eval.local.sh
+#
+# `cot_eval.local.sh` is git-ignored (it may hold a real API key), like
+# ollama.local.sh. scripts/deploy_eval_shim.sh scp's it to the remote GPU host
+# as ~/.cot_eval_env — the file cot_eval_service/restart.sh sources when it
+# (re)starts the shim. Edit it HERE and redeploy; do not hand-edit
+# ~/.cot_eval_env on the remote (it gets overwritten on the next deploy, and a
+# stray edit there is invisible to git/local review).
+#
+# Without a working GED provider, the shim still returns solvability; GED
+# (reasoning-structure similarity) is skipped with a warning.
+
+# --- Default: local Ollama, no key, no rate limit, no billing --------------
+# Reaches the SAME ollama serve instance llm_generate.py uses (same remote
+# host, localhost:11434 — no tunnel needed since the shim runs there too).
+# Needs the model pulled on the remote (`ollama pull qwen2.5:14b`).
+export COT_EVAL_GED_PROVIDER=ollama
+export COT_EVAL_GED_MODEL=qwen2.5:14b
+
+# --- Fallback: Gemini (hosted, free tier is quota-limited) ------------------
+# Uncomment to switch back. On this project's Google AI Studio account, only
+# gemini-2.5-flash has nonzero free-tier quota (20 requests/day — a single
+# /eval/pair call can burn 3-9, so this exhausts after 1-2 problems and then
+# rate-limits the rest of the session). gemini-2.0-flash / gemini-2.0-flash-lite
+# return quota limit:0; gemini-2.5-flash-lite / gemini-1.5-flash are retired
+# (404) for new users. Re-check your own project's actual quotas before
+# assuming these numbers still hold.
+# export COT_EVAL_GED_PROVIDER=gemini
+# export COT_EVAL_GED_MODEL=gemini-2.5-flash
+# export GEMINI_API_KEY=""   # AI Studio key, format "AQ.xxxxxxxx...' — NOT the old "AIza..." format

@@ -43,10 +43,12 @@ import argparse
 import atexit
 import json
 import os
+import queue
 import random
 import re
 import shlex
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -66,9 +68,15 @@ DATA_DIR = ROOT / "data"
 DATASET_FILE  = DATA_DIR / "DSPR_dataset.json"
 
 # Status field values — used throughout for filtering, never shown as UI tags.
-STATUS_ORIGINAL   = "Original (unperturbed)"
+# Pipeline: Pull → Filter → Generate → Verify, gated by this field.
+STATUS_ORIGINAL   = "Original (unperturbed)"   # pulled, not yet filtered
+STATUS_KEPT       = "Filtered (kept)"          # passed Filter → Generate's pool
+STATUS_REJECTED   = "Filtered (rejected)"      # failed Filter → excluded
 STATUS_UNVERIFIED = "Unverified"
 STATUS_VERIFIED   = "Verified"
+
+# Non-generated records (no perturbations yet) — the Filter step's working pool.
+STATUS_FILTER_POOL = (STATUS_ORIGINAL, STATUS_KEPT, STATUS_REJECTED)
 
 # Candidate HuggingFace sources for the MATH (Hendrycks) dataset, tried in order.
 # Each entry: (repo_id, config_name_or_None, split).
@@ -342,6 +350,12 @@ def apply_perturbations(record: dict, simple, hard, *, verified: bool, author: s
 
 def norm_to_raw(provider, norm: dict, pid: int) -> dict:
     """Turn a provider's normalized browse record into a DSPR_dataset record."""
+    # Every facet the provider declares (e.g. NuminaMath's question_type/source,
+    # OpenMathInstruct's problem_source) is kept here under its own namespace so
+    # it stays filterable later, without colliding with top-level fields like the
+    # record's own "source" (the pipeline/provider source, e.g. "NuminaMath-1.5").
+    facets = {f["key"]: str(norm[f["key"]]).strip()
+              for f in provider.facet_defs if norm.get(f["key"])}
     return {
         "problem_id": pid,
         # `id` is the problem's 1-based position in its source dataset (stays true
@@ -357,6 +371,7 @@ def norm_to_raw(provider, norm: dict, pid: int) -> dict:
         "hard": None,
         "answer": (norm.get("answer").strip() if norm.get("answer") else None),
         "source": provider.source,
+        "facets": facets,
         "pulled_at": now_iso(),
         "status": STATUS_ORIGINAL,
     }
@@ -516,8 +531,15 @@ def _open_tunnel() -> None:
     jump = os.getenv("SSH_JUMP", "").strip()
     if jump:
         cmd += ["-J", jump]
-    cmd += ["-L", f"{local_port}:localhost:11434",
-            os.getenv("SSH_TARGET", "").strip(),
+    cmd += ["-L", f"{local_port}:localhost:11434"]
+    # Forward the CoTSimilarity eval shim's port over the SAME connection, so the
+    # eval panel rides the tunnel the LLM panel opens (both on the GPU host).
+    try:
+        from cot_eval import COT_EVAL_PORT
+        cmd += ["-L", f"{COT_EVAL_PORT}:localhost:{COT_EVAL_PORT}"]
+    except Exception:  # noqa: BLE001 - eval is optional; never block the Ollama tunnel
+        pass
+    cmd += [os.getenv("SSH_TARGET", "").strip(),
             "-p", os.getenv("SSH_PORT", "22").strip() or "22"]
     _TUNNEL["proc"] = subprocess.Popen(
         cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -643,6 +665,237 @@ def api_llm_connect():
                     "ollama": ollama, "available": available, "reason": reason})
 
 
+# --------------------------------------------------------------------------- #
+# CoTSimilarity sample evaluation (remote shim over the shared SSH tunnel)
+# --------------------------------------------------------------------------- #
+# Evaluations are slow (vLLM sampling + LLM-segmented GED), so they run as
+# background jobs: a route enqueues {problem_id}, one worker thread drains the
+# queue (serialising calls so the resident vLLM model is hit one request at a
+# time), and the result is cached onto the record's "evaluation" field. The
+# frontend polls /api/eval_status until the job leaves the "running" state.
+_EVAL_QUEUE: "queue.Queue" = queue.Queue()
+_EVAL_JOBS = {}                 # problem_id -> job dict (state/result/error/…)
+_EVAL_LOCK = threading.Lock()   # serialises the read-modify-write of a record's eval
+
+
+def _eval_service_status() -> dict:
+    """Reachability + capability of the configured CoTSimilarity eval shim."""
+    from cot_eval import COT_EVAL_HOST, COT_EVAL_MODEL, COT_EVAL_N, probe_eval
+    probe = probe_eval()
+    return {"host": COT_EVAL_HOST, "model": probe.get("model") or COT_EVAL_MODEL,
+            "n": COT_EVAL_N, "reachable": probe["reachable"],
+            "ged_ready": probe.get("ged_ready", False), "error": probe["error"]}
+
+
+def _eval_availability(svc: dict):
+    """(available, reason) verdict shared by the eval status + connect routes."""
+    if not svc["reachable"]:
+        return False, svc["error"]
+    if not svc.get("ged_ready"):
+        return True, ("Solvability ready; GED disabled on the service — set "
+                      "DEEPSEEK_API_KEY on the remote for structural similarity.")
+    return True, "Sample evaluation is ready."
+
+
+def _ensure_eval_connection() -> dict:
+    """Ensure the eval shim is reachable, opening the shared SSH tunnel if needed.
+
+    Mirrors _ensure_connection but probes the eval service (the tunnel forwards
+    both Ollama's 11434 and the eval port, so either panel can open it).
+    """
+    from cot_eval import COT_EVAL_PORT, probe_eval
+    probe = probe_eval()
+    if probe["reachable"]:
+        return probe
+    if not _remote_configured():
+        probe["error"] = (
+            probe["error"] + " — no remote host is configured; run the shim "
+            "locally or set SSH_TARGET/TUNNEL_PORT in ollama.local.sh.")
+        return probe
+    if not _tunnel_running():
+        try:
+            _open_tunnel()
+        except FileNotFoundError:
+            return {"reachable": False, "model": None, "ged_ready": False,
+                    "error": "Cannot open SSH tunnel — `ssh` not found on the backend host."}
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        proc = _TUNNEL["proc"]
+        if proc is not None and proc.poll() is not None:
+            err = (proc.stderr.read() if proc.stderr else "").strip()
+            _TUNNEL["proc"] = None
+            return {"reachable": False, "model": None, "ged_ready": False,
+                    "error": f"SSH tunnel failed: {err or 'ssh exited unexpectedly'}"}
+        probe = probe_eval(timeout=2)
+        if probe["reachable"]:
+            return probe
+        time.sleep(0.7)
+    return {"reachable": False, "model": None, "ged_ready": False,
+            "error": (f"SSH tunnel opened but the eval shim on port {COT_EVAL_PORT} "
+                      "did not respond within 12s — is uvicorn running on the remote?")}
+
+
+def _run_eval_job(pid):
+    """Worker body for one queued evaluation: pick solvability vs pair by the
+    record's status, call the shim, and cache the result onto the record."""
+    import cot_eval
+    record = _find_record(pid)
+    if record is None:
+        raise RuntimeError(f"no record with id {pid}")
+    if record.get("status") in STATUS_FILTER_POOL:
+        # Sample one trial at a time so the UI can show a live 0→N trial bar
+        # (the shim has no per-sample callback within a single n=N call).
+        n = cot_eval.COT_EVAL_N
+        job = _EVAL_JOBS.get(pid)
+        if job is not None:
+            job["progress"] = {"trial": 0, "trials": n}
+        correct = 0
+        model = None
+        grader_errors = []
+        sample_response = None
+        for i in range(1, n + 1):
+            trial = cot_eval.eval_solvability(record, n=1)
+            correct += sum(1 for c in (trial.get("correct") or []) if c)
+            model = trial.get("model") or model
+            for err in (trial.get("errors") or []):
+                if err:
+                    grader_errors.append(err)
+            if sample_response is None:
+                responses = trial.get("responses") or []
+                if responses:
+                    sample_response = responses[0]
+            if job is not None:
+                job["progress"] = {"trial": i, "trials": n}
+        evaluation = {
+            "kind": "solvability",
+            "solvability": {"pass_rate": (correct / n if n else None), "n": n},
+            "model": model,
+            "evaluated_at": now_iso(),
+            "error": None,
+            "debug": {"errors": grader_errors, "sample_response": sample_response},
+        }
+    else:  # Unverified or Verified — the simple/hard pair exists
+        result = cot_eval.eval_pair(record)
+        original = result.get("original") or {}
+        simple = result.get("simple") or {}
+        hard = result.get("hard") or {}
+        evaluation = {
+            "kind": "pair",
+            "solvability": {"pass_rate": original.get("pass_rate"), "n": result.get("n")},
+            "pair": {
+                "original_pass_rate": original.get("pass_rate"),
+                "simple": {"pass_rate": simple.get("pass_rate"), "ged": simple.get("ged"),
+                           "similarity_normalized": simple.get("similarity_normalized")},
+                "hard": {"pass_rate": hard.get("pass_rate"), "ged": hard.get("ged"),
+                         "similarity_normalized": hard.get("similarity_normalized")},
+            },
+            "model": result.get("model"),
+            "evaluated_at": now_iso(),
+            "error": None,
+            "warnings": result.get("warnings") or [],
+        }
+    # Re-read fresh right before writing to minimise the window against a
+    # concurrent save; the lock serialises eval writes with each other.
+    with _EVAL_LOCK:
+        fresh = _find_record(pid)
+        if fresh is not None:
+            fresh["evaluation"] = evaluation
+            _update_record(fresh)
+    return evaluation
+
+
+def _eval_worker():
+    while True:
+        pid = _EVAL_QUEUE.get()
+        job = _EVAL_JOBS.get(pid)
+        if job is None:
+            continue
+        job["state"] = "running"
+        try:
+            job["result"] = _run_eval_job(pid)
+            job["state"] = "done"
+        except Exception as e:  # noqa: BLE001 - surfaced to the UI via /api/eval_status
+            job["error"] = str(e)
+            job["state"] = "error"
+        finally:
+            job["finished_at"] = now_iso()
+
+
+threading.Thread(target=_eval_worker, name="cot-eval-worker", daemon=True).start()
+
+
+@app.route("/api/eval_service_status")
+def api_eval_service_status():
+    """Passive readiness of the CoTSimilarity eval shim (no tunnel opened)."""
+    svc = _eval_service_status()
+    available, reason = _eval_availability(svc)
+    return jsonify({"ok": True, "service": svc, "available": available, "reason": reason})
+
+
+@app.route("/api/eval_connect", methods=["POST"])
+def api_eval_connect():
+    """Open the shared SSH tunnel (if needed) and probe the eval shim on demand."""
+    if not _config_present():
+        return jsonify({
+            "ok": False, "configured": False,
+            "hint_file": "ollama.local.sh.example",
+            "error": ("No ollama.local.sh found — copy ollama.local.sh.example to "
+                      "ollama.local.sh and set COT_EVAL_PORT (and your SSH host)."),
+        })
+    from cot_eval import COT_EVAL_HOST, COT_EVAL_MODEL, COT_EVAL_N
+    conn = _ensure_eval_connection()
+    svc = {"host": COT_EVAL_HOST, "model": conn.get("model") or COT_EVAL_MODEL,
+           "n": COT_EVAL_N, "reachable": conn["reachable"],
+           "ged_ready": conn.get("ged_ready", False), "error": conn["error"]}
+    available, reason = _eval_availability(svc)
+    return jsonify({"ok": True, "configured": True, "service": svc,
+                    "available": available, "reason": reason})
+
+
+@app.route("/api/eval_record", methods=["POST"])
+def api_eval_record():
+    """Enqueue a background evaluation for one record (solvability if Original,
+    full pair otherwise). Idempotent: an in-flight job is returned as-is."""
+    body = request.get_json(force=True, silent=True) or {}
+    pid = body.get("problem_id")
+    if pid is None:
+        return jsonify({"ok": False, "error": "problem_id required"}), 400
+    record = _find_record(pid)
+    if record is None:
+        return jsonify({"ok": False, "error": f"no record with id {pid}"}), 404
+    kind = "solvability" if record.get("status") in STATUS_FILTER_POOL else "pair"
+    job = _EVAL_JOBS.get(pid)
+    if job and job.get("state") in ("queued", "running"):
+        return jsonify({"ok": True, "state": job["state"], "kind": job.get("kind")})
+    _EVAL_JOBS[pid] = {"state": "queued", "kind": kind, "result": None,
+                       "error": None, "progress": None,
+                       "started_at": now_iso(), "finished_at": None}
+    _EVAL_QUEUE.put(pid)
+    return jsonify({"ok": True, "state": "queued", "kind": kind})
+
+
+@app.route("/api/eval_status")
+def api_eval_status():
+    """Poll a record's evaluation job. Returns the job state plus (when done) the
+    cached evaluation block from the record."""
+    raw = request.args.get("problem_id")
+    if raw is None:
+        return jsonify({"ok": False, "error": "problem_id required"}), 400
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        pid = raw
+    job = _EVAL_JOBS.get(pid)
+    record = _find_record(pid)
+    evaluation = (record or {}).get("evaluation")
+    if job is None:
+        # No job this session — report any cached result already on the record.
+        return jsonify({"ok": True, "state": "idle", "evaluation": evaluation})
+    return jsonify({"ok": True, "state": job["state"], "kind": job.get("kind"),
+                    "error": job.get("error"), "progress": job.get("progress"),
+                    "evaluation": job.get("result") or evaluation})
+
+
 def _status_payload(status: str) -> dict:
     """{exists, count, records} for records of a given status, for UI/API use."""
     recs = [r for r in _read_dataset() if r.get("status") == status]
@@ -651,18 +904,52 @@ def _status_payload(status: str) -> dict:
 
 @app.route("/api/records")
 def records():
-    # Browse set: every natively-shaped record in our dataset — Original
-    # (perturbations pending/none) and Verified pairs. Unverified records are
-    # excluded; they belong to the Verify tab.
-    recs = [r for r in _read_dataset()
-            if r.get("status") in (STATUS_ORIGINAL, STATUS_VERIFIED)]
-    return jsonify(recs)
+    # Browse set: every record regardless of pipeline stage — Original, Kept,
+    # Rejected, Unverified, and Verified. The frontend's Status facet is how the
+    # user narrows to a stage; this route no longer does that filtering itself.
+    return jsonify(_read_dataset())
 
 
 @app.route("/api/raw")
 def api_raw():
-    # Base problems for the Generate tab — "Original (unperturbed)" records only.
-    return jsonify(_status_payload(STATUS_ORIGINAL))
+    # Base problems for the Generate tab — Kept records (passed the Filter step).
+    return jsonify(_status_payload(STATUS_KEPT))
+
+
+@app.route("/api/filter_pool")
+def api_filter_pool():
+    # The Filter step's working pool: every non-generated record (pulled but no
+    # perturbations yet) — Original (unfiltered), Kept, and Rejected — so the UI
+    # can show each problem's current disposition and re-partition on Apply.
+    recs = [r for r in _read_dataset() if r.get("status") in STATUS_FILTER_POOL]
+    return jsonify({"exists": DATASET_FILE.exists(), "count": len(recs), "records": recs})
+
+
+@app.route("/api/apply_filter", methods=["POST"])
+def api_apply_filter():
+    """Commit a Filter-step partition: mark the given problem_ids Kept or Rejected.
+
+    Only records currently in the filter pool (Original/Kept/Rejected — i.e. not
+    yet generated) are affected; ids that are missing or already generated are
+    ignored. This is the whitelist/blacklist gate before Generate.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    keep = {int(p) for p in (body.get("keep") or []) if p is not None}
+    reject = {int(p) for p in (body.get("reject") or []) if p is not None}
+    dataset = _read_dataset()
+    kept = rejected = 0
+    for r in dataset:
+        if r.get("status") not in STATUS_FILTER_POOL:
+            continue
+        pid = r.get("problem_id")
+        if pid in keep:
+            r["status"] = STATUS_KEPT
+            kept += 1
+        elif pid in reject:
+            r["status"] = STATUS_REJECTED
+            rejected += 1
+    _write_dataset(dataset)
+    return jsonify({"ok": True, "kept": kept, "rejected": rejected})
 
 
 @app.route("/api/pull_math", methods=["POST"])
@@ -785,9 +1072,9 @@ def api_llm_generate():
         return jsonify({"ok": False, "error": "problem_id required"}), 400
     record = next((r for r in _read_dataset()
                    if r.get("problem_id") == pid
-                   and r.get("status") == STATUS_ORIGINAL), None)
+                   and r.get("status") == STATUS_KEPT), None)
     if record is None:
-        return jsonify({"ok": False, "error": f"no raw problem with id {pid}"}), 404
+        return jsonify({"ok": False, "error": f"no kept problem with id {pid}"}), 404
     try:
         from llm_generate import generate_for_problem  # lazy: no hard ollama dep
     except ImportError:
@@ -860,12 +1147,12 @@ def api_reject():
                    if r.get("problem_id") == pid and r.get("status") == STATUS_UNVERIFIED), None)
     if record is None:
         return jsonify({"ok": False, "error": f"no pending problem with id {pid}"}), 404
-    # Revert to the base problem: drop the perturbations, keep the original so it
-    # returns to the Generate pool to be re-perturbed.
+    # Revert to the base problem: drop the perturbations and return it to the Kept
+    # pool (it already passed the Filter step) so it re-enters Generate, not Filter.
     record["simple"] = None
     record["hard"] = None
     record.pop("create_author", None)
-    record["status"] = STATUS_ORIGINAL
+    record["status"] = STATUS_KEPT
     _write_dataset(dataset)
     return jsonify({"ok": True, "record": record})
 
@@ -888,12 +1175,27 @@ def main():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
 
+    sub.add_parser("reset-unfiltered",
+                   help="One-time: delete every un-filtered 'Original' record "
+                        "(pulled but not yet run through the Filter step)")
+
     args = parser.parse_args()
 
     if args.cmd == "pull":
         added = pull_math(count=args.count, levels=args.levels,
                           types=args.types, seed=args.seed)
         print(f"Added {len(added)} problems to {DATASET_FILE}")
+        return
+
+    if args.cmd == "reset-unfiltered":
+        dataset = _read_dataset()
+        kept = [r for r in dataset if r.get("status") != STATUS_ORIGINAL]
+        removed = len(dataset) - len(kept)
+        _write_dataset(kept)
+        from collections import Counter
+        counts = Counter(r.get("status") for r in kept)
+        print(f"Removed {removed} '{STATUS_ORIGINAL}' record(s) from {DATASET_FILE}")
+        print("Remaining by status: " + (", ".join(f"{k}: {v}" for k, v in counts.items()) or "(empty)"))
         return
 
     host = getattr(args, "host", "127.0.0.1")

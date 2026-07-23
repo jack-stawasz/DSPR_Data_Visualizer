@@ -172,9 +172,22 @@ def generate_variants(client, record: dict, model: str) -> dict:
     if not text:
         raise RuntimeError("Ollama returned no text content to parse.")
     try:
-        # Ollama's SDK already decoded the JSON once; re-encoding lone backslashes
-        # prevents \frac → form-feed + "rac" when json.loads runs a second time.
-        text_fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+        # This content is (almost) always LaTeX-heavy math, so a lone backslash
+        # here is essentially never an intentional JSON control-char escape —
+        # it's the model writing \frac/\tan/\boxed/\rfloor/\neq/\begin as a
+        # human would. Those all start with a letter (b/f/n/r/t/u) that also
+        # happens to be a valid JSON escape, so a second json.loads() would
+        # silently eat the letter and splice in a real form-feed/tab/backspace
+        # control character instead of erroring. Double every lone backslash so
+        # the second parse treats it literally — but an already-doubled pair
+        # (the model sometimes DOES escape correctly) must be matched and left
+        # alone as a 2-char unit, not scanned backslash-by-backslash: a
+        # lookahead-only check re-escapes the second backslash of a `\\frac`
+        # pair too, turning it into 3 backslashes and corrupting it exactly
+        # the same way (\ + form-feed + "rac").
+        def _double_lone_backslash(m):
+            return m.group(0) if m.group(0) != "\\" else "\\\\"
+        text_fixed = re.sub(r'\\\\|\\"|\\', _double_lone_backslash, text)
         data = json.loads(text_fixed)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Could not parse Ollama's JSON response: {e}\n{text[:300]}") from e

@@ -23,6 +23,10 @@ TUNNEL_PORT="${TUNNEL_PORT:-}"   # blank = no SSH tunnel
 # backend now opens that tunnel lazily (when the user enters the LLM panel), so
 # here we only export the SSH params for it to rebuild the same ssh command.
 export SSH_JUMP SSH_TARGET SSH_PORT TUNNEL_PORT
+# CoTSimilarity eval shim: the backend reads these at import and forwards
+# COT_EVAL_PORT over the same SSH tunnel as Ollama (default 8100 when unset).
+export COT_EVAL_PORT="${COT_EVAL_PORT:-8100}"
+export COT_EVAL_HOST COT_EVAL_N COT_EVAL_MODEL
 USE_TUNNEL=""
 if [ -n "$SSH_TARGET" ] && [ -n "$TUNNEL_PORT" ]; then
     USE_TUNNEL=1

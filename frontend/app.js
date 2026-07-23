@@ -83,29 +83,118 @@ function showFilePicker(msg) {
   });
   row.appendChild(note);
   row.appendChild(input);
+  requestAnimationFrame(syncHeaderHeight);
 }
+
+// The header is sticky and its height varies (loaderRow content, wrapped
+// controls on narrow screens), so .ds-filters' sticky offset is driven by
+// this CSS var rather than a hardcoded px value — otherwise the sidebar
+// scrolls up under the header and its top gets clipped/inaccessible.
+function syncHeaderHeight() {
+  const header = document.querySelector("header");
+  if (!header) return;
+  document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+}
+window.addEventListener("resize", syncHeaderHeight);
 
 function onLoaded(recs, source) {
   RECORDS = recs;
   document.getElementById("loaderRow").innerHTML =
     `<span class="sub">Loaded <b>${recs.length}</b> records from <code class="kbd">${source}</code></span>`;
-  populateTypeFilter();
+  renderBrowseFacets();
+  render();
+  requestAnimationFrame(syncHeaderHeight);
+}
+
+// --------------------------------------------------------------------------
+// Browse facets: chip-based filters over the full dataset (every pipeline
+// stage — Original/Kept/Rejected/Unverified/Verified — now that /api/records
+// returns everything). Mirrors the Filter tab's facet pattern
+// (FILTER_FACETS/filterFacetDefs/renderFilterFacets) but without the Filter
+// tab's sort/threshold controls, which don't apply to Browse.
+// --------------------------------------------------------------------------
+const BROWSE_FACETS = {};   // facetKey -> Set(values)
+
+// get(r) pulls each facet's value off a record. Provider-declared facets
+// beyond type/level/source (NuminaMath's question_type/source, OpenMath's
+// problem_source) live under r.facets, namespaced there by norm_to_raw to
+// avoid colliding with the record's own top-level "source" field.
+const BROWSE_FACET_DEFS = [
+  { key: "status", label: "Pipeline stage", get: r => r.status },
+  { key: "source", label: "Source dataset", get: r => r.source },
+  { key: "level", label: "Level", get: r => r.level },
+  { key: "type", label: "Subject", get: r => r.type },
+  { key: "problem_type", label: "Problem Type", get: r => r.facets && r.facets.problem_type },
+  { key: "question_type", label: "Question Type", get: r => r.facets && r.facets.question_type },
+  { key: "row_source", label: "Row Source", get: r => r.facets && r.facets.source },
+  { key: "problem_source", label: "Problem Source", get: r => r.facets && r.facets.problem_source },
+  { key: "create_author", label: "Created by", get: r => r.create_author },
+  { key: "verify_author", label: "Verified by", get: r => r.verify_author },
+];
+
+function browseFacetDefs() {
+  return BROWSE_FACET_DEFS.map(f => {
+    const values = [...new Set(RECORDS.map(r => (f.get(r) || "").toString().trim()).filter(Boolean))].sort();
+    return { key: f.key, label: f.label, values };
+  }).filter(f => f.values.length);
+}
+
+function matchesBrowseFacets(r) {
+  for (const f of BROWSE_FACET_DEFS) {
+    const want = BROWSE_FACETS[f.key];
+    if (want && want.size && !want.has((f.get(r) || "").toString().trim())) return false;
+  }
+  return true;
+}
+
+function toggleBrowseFacet(key, value) {
+  if (!BROWSE_FACETS[key]) BROWSE_FACETS[key] = new Set();
+  const set = BROWSE_FACETS[key];
+  if (set.has(value)) set.delete(value); else set.add(value);
+  if (!set.size) delete BROWSE_FACETS[key];
+  renderBrowseFacets();
   render();
 }
 
-function populateTypeFilter() {
-  const sel = document.getElementById("typeFilter");
-  const cur = sel.value;
-  // Rebuild from scratch each load — appending caused duplicate options.
-  // Trim so " Algebra"/"Algebra" collapse into one entry.
-  const types = [...new Set(RECORDS.map(r => (r.type || "").trim()).filter(Boolean))].sort();
-  sel.innerHTML = '<option value="">All types</option>';
-  for (const t of types) {
-    const opt = document.createElement("option");
-    opt.value = t; opt.textContent = t;
-    sel.appendChild(opt);
-  }
-  sel.value = cur;  // preserve the user's current selection across reloads
+function clearBrowseFilters() {
+  for (const k of Object.keys(BROWSE_FACETS)) delete BROWSE_FACETS[k];
+  renderBrowseFacets();
+  render();
+}
+
+function renderBrowseFacets() {
+  const panel = document.getElementById("browseFacets");
+  if (!panel) return;
+  const defs = browseFacetDefs();
+  const groups = defs.map(f => {
+    const chips = f.values.map(v => {
+      const active = BROWSE_FACETS[f.key] && BROWSE_FACETS[f.key].has(v);
+      return `<button type="button" class="ds-chip${active ? " active" : ""}" ` +
+             `data-facet="${escapeHtml(f.key)}" data-value="${escapeHtml(v)}">${escapeHtml(v)}</button>`;
+    }).join("");
+    const count = BROWSE_FACETS[f.key] ? BROWSE_FACETS[f.key].size : 0;
+    return `<div class="ds-fgroup">
+        <div class="ds-fhead">${escapeHtml(f.label)}${count ? ` <span class="ds-fcount">${count}</span>` : ""}</div>
+        <div class="ds-chips">${chips}</div>
+      </div>`;
+  }).join("");
+  panel.innerHTML = `
+    <div class="ds-fhead-row">
+      <span class="ds-fpanel-title">Filters</span>
+      <button id="browseFilterClear" type="button" class="ds-fclear">Clear</button>
+    </div>
+    ${groups || `<div class="hint">No records loaded yet.</div>`}`;
+  panel.querySelector("#browseFilterClear").addEventListener("click", clearBrowseFilters);
+  panel.querySelectorAll(".ds-chip").forEach(btn =>
+    btn.addEventListener("click", () => toggleBrowseFacet(btn.dataset.facet, btn.dataset.value)));
+}
+
+// Visual mapping from a record's pipeline stage to an existing badge colour —
+// reuses .badge.kept (green) / .badge.rejected (red) / .badge.aug (muted).
+function statusBadgeKind(status) {
+  if (status === "Verified") return "kept";
+  if (status === "Filtered (rejected)") return "rejected";
+  return "aug";
 }
 
 function escapeHtml(s) {
@@ -217,7 +306,10 @@ function typesetMath(el) {
 function renderTags(tags) {
   return (tags || [])
     .filter(t => t && t.text)
-    .map(t => `<span class="badge ${t.kind || ""}">${escapeHtml(String(t.text))}</span>`)
+    .map(t => {
+      const title = t.title ? ` title="${escapeHtml(String(t.title))}"` : "";
+      return `<span class="badge ${t.kind || ""}"${title}>${escapeHtml(String(t.text))}</span>`;
+    })
     .join("");
 }
 
@@ -263,6 +355,11 @@ function renderProblemDisplay(container, model, opts) {
          <div class="preview-label">Answer / Solution</div>
          <div class="preview answer-text">${renderAnswerField(String(model.answer))}</div>
        </div>` : "";
+  const debugSample = model.debugSample
+    ? `<details class="pv-debug-sample">
+        <summary>Last eval sample (raw model output)</summary>
+        <div class="preview">${escapeHtml(model.debugSample)}</div>
+      </details>` : "";
   let pert = "";
   if (opts.perturbations) {
     const n = (model.perturbations || []).length;
@@ -283,6 +380,7 @@ function renderProblemDisplay(container, model, opts) {
       <div class="preview">${renderMathField(model.problem || "")}</div>
     </div>
     ${answer}
+    ${debugSample}
     ${pert}`;
   typesetMath(el);
 }
@@ -532,14 +630,13 @@ function variantBlock(tag, obj) {
 
 function render() {
   const q = document.getElementById("search").value.trim().toLowerCase();
-  const typeF = document.getElementById("typeFilter").value;
   const list = document.getElementById("list");
   const variantsToShow = ["original", "simple", "hard"];
 
   let shown = 0;
   const html = [];
   for (const r of RECORDS) {
-    if (typeF && (r.type || "").trim() !== typeF) continue;
+    if (!matchesBrowseFacets(r)) continue;
     if (q) {
       const hay = (String(r.problem_id) + " " + (r.type||"") + " " +
         JSON.stringify(r.original||"") + JSON.stringify(r.simple||"") + JSON.stringify(r.hard||"")).toLowerCase();
@@ -555,10 +652,12 @@ function render() {
           <span class="pid">${escapeHtml(
             r.source && r.id != null ? idLabel(sourceAbbrev(r.source), r.id) : `ID: ${r.problem_id ?? "?"}`
           )}</span>
+          ${r.status ? `<span class="badge ${statusBadgeKind(r.status)}">${escapeHtml(r.status)}</span>` : ""}
           ${r.type ? `<span class="badge type">${escapeHtml(r.type)}</span>` : ""}
           ${r.level ? `<span class="badge level">${escapeHtml(r.level)}</span>` : ""}
           ${r.create_author ? `<span class="badge author">${escapeHtml(r.create_author)}</span>` : ""}
           ${r.verify_author ? `<span class="badge verifier">${escapeHtml(r.verify_author)}</span>` : ""}
+          ${renderTags([solveTag(r), graderErrorTag(r)])}
         </div>
         <div class="variants">
           ${originalBlock}
@@ -595,7 +694,6 @@ function setAllAnswers(visible) {
 }
 
 document.getElementById("search").addEventListener("input", render);
-document.getElementById("typeFilter").addEventListener("change", render);
 document.getElementById("toggleAllBtn").addEventListener("click", () => setAllAnswers(!ANSWERS_SHOWN));
 
 // --------------------------------------------------------------------------
@@ -615,15 +713,19 @@ function showTab(name) {
   document.getElementById("browseView").classList.toggle("hidden", !browse);
   document.getElementById("createView").classList.toggle("hidden", browse);
   document.getElementById("browseControls").style.display = browse ? "" : "none";
+  // Browse's facet sidebar needs extra width so it doesn't shrink the card
+  // column (see main.wide in styles.css).
+  document.querySelector("main").classList.toggle("wide", browse);
 
   for (const t of TABS) {
     document.getElementById(NAV_ID[t]).classList.toggle("active", t === name);
   }
   if (!browse) {
-    // All three sections are visible at once, so populate each in order.
+    // All four sections are visible at once, so populate each in order.
     refreshCreateScreen();
     initDatasetBrowser();
-    populateBaseSelect();
+    loadFilterPool();       // Filter step (Original/Kept/Rejected pool)
+    populateBaseSelect();   // Generate step (Kept pool)
     loadPending();
     if (GEN_MODE === "llm") connectAndRefreshLLM();
   }
@@ -670,10 +772,10 @@ async function populateBaseSelect() {
     CONSUMED_PIDS.clear();
     if (!data.exists) {
       setStatus("generateStatus",
-        "No problems pulled yet — DSPR_dataset.json has no original problems. Use the Pull tab first.", "err");
+        "No problems pulled yet — DSPR_dataset.json is empty. Use the Pull tab first.", "err");
     } else if (!RAW_RECORDS.length) {
       setStatus("generateStatus",
-        "No original problems found — pull some problems first.", "err");
+        "No Kept problems yet — evaluate and Apply filters in the Filter step to promote problems here.", "err");
     } else {
       setStatus("generateStatus", "", "");  // count is redundant with the nav indicator
     }
@@ -683,6 +785,21 @@ async function populateBaseSelect() {
   }
   BASE_IDX = RAW_RECORDS.length ? 0 : -1;
   updateBaseNav();
+}
+
+// Load the Filter step's working pool (non-generated records: Original / Kept /
+// Rejected) — separate from Generate's Kept-only base pool (RAW_RECORDS).
+async function loadFilterPool() {
+  if (!BACKEND) { FILTER_RECORDS = []; refreshFilterSection({ reset: true }); return; }
+  try {
+    const data = await (await fetch("/api/filter_pool")).json();
+    FILTER_RECORDS = Array.isArray(data.records) ? data.records : [];
+    FILTER_RECORDS.sort((a, b) => (a.problem_id ?? 0) - (b.problem_id ?? 0));
+  } catch (e) {
+    FILTER_RECORDS = [];
+    setStatus("filterStatus", "Failed to load the filter pool: " + e.message, "err");
+  }
+  refreshFilterSection({ reset: true });
 }
 
 // Refresh the shared nav indicator + Prev/Next state, then re-render the viewer.
@@ -786,8 +903,7 @@ const DS = {
   cache: {},           // id -> {records, facets, sorts}
   selected: {},        // id -> { facetKey: Set(values) }
   search: "",
-  sort: "",
-  filtered: [],        // current filtered+sorted result (the working set)
+  filtered: [],        // current filtered result (the working set)
   idx: -1,             // pointer into DS.filtered (single-card navigator)
   inited: false,
 };
@@ -872,21 +988,12 @@ function currentDataset() {
 async function selectDataset(id) {
   DS.current = id;
   DS.search = "";
-  DS.sort = "";
   if (!DS.selected[id]) DS.selected[id] = {};
   document.getElementById("dsSearch").value = "";
   document.querySelectorAll("#dsTabs button").forEach(b =>
     b.classList.toggle("active", b.dataset.ds === id));
   const meta = currentDataset();
   document.getElementById("dsDesc").innerHTML = datasetDescHtml(meta);
-  // Populate the sort dropdown for this dataset.
-  const sortSel = document.getElementById("dsSort");
-  sortSel.innerHTML = '<option value="">Sort: default</option>';
-  for (const s of (meta && meta.sorts) || []) {
-    const opt = document.createElement("option");
-    opt.value = s.key; opt.textContent = "Sort: " + s.label;
-    sortSel.appendChild(opt);
-  }
   await ensureDatasetLoaded(id);
   renderDatasetBrowser();
 }
@@ -921,22 +1028,13 @@ function toggleFacet(facetKey, value) {
   renderDatasetBrowser();
 }
 
-function clearDatasetFilters() {
-  DS.selected[DS.current] = {};
-  DS.search = "";
-  DS.sort = "";
-  document.getElementById("dsSearch").value = "";
-  document.getElementById("dsSort").value = "";
-  renderDatasetBrowser();
-}
-
-// Records passing the active facet selections + search box, then sorted.
+// Records passing the active facet selections + search box.
 function filteredDatasetRecords() {
   const cache = DS.cache[DS.current];
   if (!cache) return [];
   const sel = DS.selected[DS.current] || {};
   const q = DS.search.trim().toLowerCase();
-  let recs = cache.records.filter(r => {
+  return cache.records.filter(r => {
     // AND across facets, OR within a facet's selected values. The synthetic
     // "__status" facet maps the boolean r.pulled onto new / already pulled.
     for (const key of Object.keys(sel)) {
@@ -953,11 +1051,6 @@ function filteredDatasetRecords() {
     }
     return true;
   });
-  if (DS.sort) {
-    recs = [...recs].sort((a, b) =>
-      String(a[DS.sort] ?? "").localeCompare(String(b[DS.sort] ?? "")));
-  }
-  return recs;
 }
 
 // A filter/sort/search/tab change rebuilds the working set and snaps back to
@@ -972,6 +1065,7 @@ function renderDatasetBrowser() {
 
 function renderDatasetFilters() {
   const panel = document.getElementById("dsFilters");
+  if (!panel) return;   // facet filtering moved to the Filter step; Pull has no panel
   const cache = DS.cache[DS.current];
   const sel = DS.selected[DS.current] || {};
   if (!cache) { panel.innerHTML = ""; return; }
@@ -1033,8 +1127,6 @@ function stepDataset(delta) {
 // Render the single focused problem through the shared Problem Viewer, refresh
 // the nav indicator, and set the Pull button state for the current record.
 function renderDatasetCurrent() {
-  const total = DS.cache[DS.current] ? DS.cache[DS.current].records.length : 0;
-  document.getElementById("dsCount").textContent = `${DS.filtered.length} / ${total} match`;
   const viewer = document.getElementById("dsViewer");
   const rec = currentDatasetRecord();
   updateNav({ prev: "dsPrev", next: "dsNext", indicator: "dsIndicator", jump: "dsJump" },
@@ -1046,6 +1138,9 @@ function renderDatasetCurrent() {
   }
   updatePullButton();
 }
+
+// problem_ids pulled in the current batch — consumed by the optional eval phase.
+let PULLED_PIDS = [];
 
 // Pull section batch descriptor. Eligible = filtered records not yet pulled;
 // the per-item action posts one record to /api/pull_record. The shared runBatch
@@ -1063,7 +1158,11 @@ const pullSection = {
         body: JSON.stringify({ dataset: DS.current, record: rec }),
       });
       const data = await res.json();
-      if (data.ok) { rec.pulled = true; return { ok: true }; }
+      if (data.ok) {
+        rec.pulled = true;
+        if (data.record && data.record.problem_id != null) PULLED_PIDS.push(data.record.problem_id);
+        return { ok: true };
+      }
       // A duplicate is already in the store — treat it as pulled, count as a skip.
       if (data.error && data.error.includes("duplicate")) rec.pulled = true;
       return { ok: false, error: data.error };
@@ -1082,9 +1181,19 @@ const pullSection = {
       `Pulled ${ok} problem(s) from ${label}` + (fail ? `, ${fail} failed/skipped.` : "."),
       fail ? "err" : "ok");
     renderDatasetCurrent();
-    // Keep the Browse view and the Generate base list in sync (once, after the batch).
+    // Keep Browse, the Generate base list, and the Filter pool in sync.
     await refreshBrowse();
-    populateBaseSelect();
+    await populateBaseSelect();
+    await loadFilterPool();
+    // Optional eval phase: score the just-pulled problems (two progress bars).
+    const evalOn = document.getElementById("pullEval") && document.getElementById("pullEval").checked;
+    const pids = PULLED_PIDS.slice();
+    PULLED_PIDS = [];
+    if (evalOn && pids.length) {
+      await evalPulledBatch(pids);
+      await loadFilterPool();   // reflect the new solve scores
+      await refreshBrowse();
+    }
   },
 };
 
@@ -1099,6 +1208,85 @@ function updatePullButton() {
   const n = selectBatchItems(pullSection.getEligible(), rec, cfg).length;
   btn.disabled = n === 0;
   btn.textContent = n ? `Pull ${n} selected →` : "Pull selected →";
+}
+
+// Poll one record's eval job to completion, driving the per-trial bar from the
+// job's {trial, trials} progress. ~700ms cadence for a responsive 0→N sweep.
+async function pollEvalWithTrials(pid, trialBar, trialLabel) {
+  for (let i = 0; i < 1200; i++) {   // ~14 min ceiling
+    await new Promise(r => setTimeout(r, 700));
+    let data;
+    try {
+      data = await (await fetch(`/api/eval_status?problem_id=${encodeURIComponent(pid)}`)).json();
+    } catch (e) { return { state: "error", error: "lost connection to the backend" }; }
+    const p = data.progress;
+    if (p && p.trials) {
+      trialBar.style.width = (p.trial / p.trials) * 100 + "%";
+      if (trialLabel) trialLabel.textContent = `Trials ${p.trial} / ${p.trials}`;
+    }
+    if (data.state && !["queued", "running"].includes(data.state)) {
+      if (data.state === "done") trialBar.style.width = "100%";
+      return data;
+    }
+  }
+  return { state: "error", error: "evaluation timed out" };
+}
+
+// Eval phase after a pull (toggle on): score each pulled problem in turn, with an
+// outer bar over problems and an inner bar sweeping the N sampling trials.
+async function evalPulledBatch(pids) {
+  const wrap = document.getElementById("pullEvalWrap");
+  const probBar = document.getElementById("pullEvalProblemBar");
+  const trialBar = document.getElementById("pullEvalTrialBar");
+  const probLabel = document.getElementById("pullEvalProblemLabel");
+  const trialLabel = document.getElementById("pullEvalTrialLabel");
+  setStatus("pullEvalStatus", "Connecting to the eval service…", "");
+  if (!(await ensureEvalReady())) {
+    setStatus("pullEvalStatus",
+      "Eval service unavailable: " + (EVAL_STATUS.reason || "unreachable") +
+      " — problems were pulled but not scored.", "err");
+    return;
+  }
+  if (wrap) wrap.classList.remove("hidden");
+  const total = pids.length;
+  let done = 0, failed = 0;
+  for (const pid of pids) {
+    if (probLabel) probLabel.textContent = `Problem ${done + 1} / ${total}`;
+    if (probBar) probBar.style.width = (done / total) * 100 + "%";
+    if (trialBar) trialBar.style.width = "0%";
+    if (trialLabel) trialLabel.textContent = "Trials";
+    setStatus("pullEvalStatus", `Evaluating ${done + 1} / ${total} on the GPU host…`, "");
+    let enqueued = false;
+    try {
+      const data = await (await fetch("/api/eval_record", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ problem_id: pid }),
+      })).json();
+      enqueued = !!data.ok;
+    } catch (e) { /* fall through to failed */ }
+    if (enqueued) {
+      const res = await pollEvalWithTrials(pid, trialBar, trialLabel);
+      if (res.state === "done" && res.evaluation) {
+        const rec = FILTER_RECORDS.find(r => r.problem_id === pid);
+        if (rec) rec.evaluation = res.evaluation;
+      } else {
+        failed++;
+      }
+    } else {
+      failed++;
+    }
+    done++;
+    if (probBar) probBar.style.width = (done / total) * 100 + "%";
+  }
+  if (trialBar) trialBar.style.width = "100%";
+  setStatus("pullEvalStatus",
+    `Evaluated ${total - failed} / ${total} problem(s)` + (failed ? `, ${failed} failed.` : "."),
+    failed ? "err" : "ok");
+  setTimeout(() => {
+    if (wrap) wrap.classList.add("hidden");
+    if (probBar) probBar.style.width = "0%";
+    if (trialBar) trialBar.style.width = "0%";
+  }, 900);
 }
 
 async function savePerturbation() {
@@ -1245,6 +1433,8 @@ async function connectAndRefreshLLM() {
   LLM_STATUS = { checked: true, server: true, available: !!data.available,
     reason: data.reason || "", data };
   seedModelSelection(data.ollama || {});
+  // Probe the CoTSimilarity eval shim over the same tunnel and show its row.
+  await connectEval();
   renderLLMStatus();
   updateLLMControls();
 }
@@ -1339,6 +1529,15 @@ function renderLLMStatus() {
            </div>
          </div>`);
     }
+  }
+  // CoTSimilarity eval service row (probed alongside Ollama over the same tunnel).
+  if (EVAL_STATUS.checked) {
+    const st = EVAL_STATUS.reachable ? (EVAL_STATUS.ged_ready ? "ok" : "warn") : "err";
+    const detail = EVAL_STATUS.reachable
+      ? (`Eval shim reachable at ${EVAL_STATUS.host}` +
+         (EVAL_STATUS.ged_ready ? "" : " — GED disabled (set DEEPSEEK_API_KEY on the remote)"))
+      : (EVAL_STATUS.reason || "Unreachable");
+    rows.push(dotLine(st, "CoT eval", detail));
   }
   document.getElementById("llmStatusBody").innerHTML = rows.join("");
 }
@@ -1492,12 +1691,13 @@ function stepVerify(delta) {
   updateVerifyNav();
 }
 
-function pendingVariantBlock(tag, obj) {
+function pendingVariantBlock(tag, obj, ev) {
   if (!obj) return "";
   return `
     <div class="variant ${tag}">
       <div class="variant-head">
         <span class="vtag ${tag}">${tag}</span>
+        ${evalPairBadge(ev, tag)}
       </div>
       <div class="problem-text">${renderMathField(obj.problem || "")}</div>
       ${obj.answer ? `
@@ -1517,6 +1717,10 @@ function pendingGroupToModel(rec) {
   if (rec.type) tags.push({ text: rec.type, kind: "type" });
   if (rec.level) tags.push({ text: rec.level, kind: "level" });
   if (rec.create_author) tags.push({ text: rec.create_author, kind: "author" });
+  const solve = rec.evaluation && rec.evaluation.solvability;
+  if (solve && solve.pass_rate != null) {
+    tags.push({ text: `orig solve ${Math.round(solve.pass_rate * 100)}%`, kind: "eval" });
+  }
   tags.push({ text: "pending review", kind: "aug" });
   const perturbations = [["simple", rec.simple], ["hard", rec.hard]]
     .filter(([, v]) => v)
@@ -1555,7 +1759,8 @@ function renderCurrentPending() {
   renderProblemDisplay("verifyDisplay", pendingGroupToModel(rec));
   const variantsEl = list.querySelector("#verifyVariants");
   if (variantsEl) {
-    variantsEl.innerHTML = pendingVariantBlock("simple", rec.simple) + pendingVariantBlock("hard", rec.hard);
+    variantsEl.innerHTML = pendingVariantBlock("simple", rec.simple, rec.evaluation)
+                         + pendingVariantBlock("hard", rec.hard, rec.evaluation);
     typesetMath(variantsEl);
   }
   if (approve) approve.disabled = false;
@@ -1620,6 +1825,415 @@ async function runVerifyBatch(action) {
   });
 }
 
+// --------------------------------------------------------------------------
+// CoTSimilarity sample evaluation. Two signals scored on the remote GPU host:
+// solvability (does the math model solve it, pass-rate over N samples) at the
+// Pull/base stage, and the full pair (solvability + reasoning-structure GED of
+// simple/hard vs the original) at Verify. Runs are slow, so the backend queues
+// them as background jobs and caches the result onto the record; here we enqueue
+// then poll /api/eval_status, and surface the cached result as badges.
+// --------------------------------------------------------------------------
+let EVAL_STATUS = { checked: false, available: false, reachable: false,
+                    ged_ready: false, reason: "", host: "", n: null };
+
+// Open the shared SSH tunnel (if needed) and probe the eval shim. Idempotent.
+async function connectEval() {
+  try {
+    const data = await (await fetch("/api/eval_connect", { method: "POST" })).json();
+    if (data.configured === false) {
+      EVAL_STATUS = { checked: true, available: false, reachable: false,
+        ged_ready: false, reason: data.error || "Eval service not configured.",
+        host: "", n: null };
+    } else {
+      const s = data.service || {};
+      EVAL_STATUS = { checked: true, available: !!data.available, reachable: !!s.reachable,
+        ged_ready: !!s.ged_ready, reason: data.reason || "", host: s.host || "", n: s.n };
+    }
+  } catch (e) {
+    EVAL_STATUS = { checked: true, available: false, reachable: false,
+      ged_ready: false, reason: "Backend server is offline.", host: "", n: null };
+  }
+}
+
+async function ensureEvalReady() {
+  if (EVAL_STATUS.available) return true;
+  await connectEval();
+  return EVAL_STATUS.available;
+}
+
+// Poll a record's eval job until it leaves the running/queued state (~15 min cap).
+async function pollEvalUntilDone(pid) {
+  for (let i = 0; i < 450; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    let data;
+    try {
+      data = await (await fetch(`/api/eval_status?problem_id=${encodeURIComponent(pid)}`)).json();
+    } catch (e) { return { state: "error", error: "lost connection to the backend" }; }
+    if (data.state && !["queued", "running"].includes(data.state)) return data;
+  }
+  return { state: "error", error: "evaluation timed out (still running on the server)" };
+}
+
+// Enqueue + poll one record's evaluation, reporting into statusId. onDone(evaluation)
+// fires with the cached evaluation block when the job finishes successfully.
+async function runRecordEval(pid, statusId, onDone) {
+  if (!BACKEND) { setStatus(statusId, "Backend not detected — start the server first.", "err"); return; }
+  if (pid == null) { setStatus(statusId, "This record has no problem_id to evaluate.", "err"); return; }
+  setStatus(statusId, "Connecting to the eval service…", "");
+  if (!(await ensureEvalReady())) {
+    setStatus(statusId, "Eval service unavailable: " + (EVAL_STATUS.reason || "unreachable"), "err");
+    return;
+  }
+  try {
+    const data = await (await fetch("/api/eval_record", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ problem_id: pid }),
+    })).json();
+    if (!data.ok) { setStatus(statusId, "Error: " + data.error, "err"); return; }
+  } catch (e) { setStatus(statusId, "Request failed: " + e.message, "err"); return; }
+  setStatus(statusId, "Evaluating on the GPU host — this can take a few minutes…", "");
+  const result = await pollEvalUntilDone(pid);
+  if (result.state === "done" && result.evaluation) {
+    const warns = (result.evaluation.warnings || []);
+    setStatus(statusId, "Done." + (warns.length ? " " + warns.join(" ") : ""), warns.length ? "" : "ok");
+    onDone(result.evaluation);
+  } else if (result.state === "error") {
+    setStatus(statusId, "Evaluation failed: " + (result.error || "unknown error"), "err");
+  } else {
+    setStatus(statusId, "Evaluation returned no result.", "err");
+  }
+}
+
+// Colour a pass-rate badge: green ≥80%, amber ≥40%, else red.
+function passRateKind(pct) { return pct >= 80 ? "ok" : (pct >= 40 ? "warn" : "err"); }
+
+// Solvability badge HTML from an evaluation block (used on the base problem).
+function evalSolveBadge(ev) {
+  const s = ev && ev.solvability;
+  if (!s || s.pass_rate == null) return "";
+  const pct = Math.round(s.pass_rate * 100);
+  return `<span class="badge eval ${passRateKind(pct)}" ` +
+         `title="Model solved ${pct}% of ${s.n} sampled attempts">solve ${pct}%</span>`;
+}
+
+// Solve-% of a record's ORIGINAL problem, as an integer percent or null when
+// unevaluated. Prefers the base-stage solvability pass-rate, falling back to the
+// original's pass-rate from a full pair eval (a Verified record may carry only that).
+function solvePct(rec) {
+  const ev = rec && rec.evaluation;
+  const pr = (ev && ev.solvability && ev.solvability.pass_rate != null)
+    ? ev.solvability.pass_rate
+    : (ev && ev.pair && ev.pair.original && ev.pair.original.pass_rate != null
+        ? ev.pair.original.pass_rate : null);
+  return pr == null ? null : Math.round(pr * 100);
+}
+
+// Solve-% tag descriptor ({text, kind}) for a record — "solve N%" (coloured by
+// pass rate) or a muted "solve n/a" before evaluation. Shared by the Filter
+// viewer and the Browse cards.
+function solveTag(rec) {
+  const pct = solvePct(rec);
+  return pct == null
+    ? { text: "solve n/a", kind: "eval na" }
+    : { text: `solve ${pct}%`, kind: "eval " + passRateKind(pct) };
+}
+
+// Extra warning tag when the grader itself crashed on one or more trials —
+// distinguishes "the shim's answer_check threw" from a genuine low score,
+// which otherwise look identical (both render as a low/0% solve tag).
+function graderErrorTag(rec) {
+  const errs = rec && rec.evaluation && rec.evaluation.debug && rec.evaluation.debug.errors;
+  if (!errs || !errs.length) return null;
+  return { text: "grader error", kind: "grader-err", title: errs[0] };
+}
+
+// Per-variant pair badge (pass-rate + structural similarity) for simple/hard.
+function evalPairBadge(ev, which) {
+  const p = ev && ev.pair && ev.pair[which];
+  if (!p) return "";
+  const parts = [];
+  if (p.pass_rate != null) parts.push(`solve ${Math.round(p.pass_rate * 100)}%`);
+  if (p.similarity_normalized != null) parts.push(`sim ${Number(p.similarity_normalized).toFixed(2)}`);
+  else if (p.ged != null) parts.push(`GED ${p.ged}`);
+  if (!parts.length) return "";
+  return `<span class="badge eval" title="CoTSimilarity: solvability + reasoning-structure similarity vs original">${escapeHtml(parts.join(" · "))}</span>`;
+}
+
+async function evalCurrentPending() {
+  const rec = verifySection.getCurrent();
+  if (!rec) { setStatus("verifyEvalStatus", "No pending problem selected.", "err"); return; }
+  const btn = document.getElementById("verifyEvalBtn");
+  if (btn) btn.disabled = true;
+  await runRecordEval(rec.problem_id, "verifyEvalStatus", (ev) => {
+    rec.evaluation = ev;        // cache on the in-memory pending record
+    renderCurrentPending();     // re-render so the variant badges appear
+  });
+  if (btn) btn.disabled = false;
+}
+
+// --------------------------------------------------------------------------
+// Filter section: the required pipeline stage between Pull and Generate. It
+// works over the non-generated pool (Original / Kept / Rejected, from
+// /api/filter_pool) — separate from Generate's Kept-only base pool. Evaluate
+// solvability, narrow by solve-% threshold + Level/Subject facets, then "Apply
+// filters" to commit: problems passing the filters are marked Kept (→ Generate),
+// the rest Rejected. The threshold/facets are the whitelist; Apply is the gate.
+// --------------------------------------------------------------------------
+let FILTER_RECORDS = [];          // the filter pool (Original/Kept/Rejected)
+let FILTER_FILTERED = [];         // working set (view over FILTER_RECORDS)
+let FILTER_IDX = -1;              // pointer into FILTER_FILTERED
+const FILTER_FACETS = {};         // facetKey -> Set(values)
+let FILTER_THRESHOLD = 0;         // min solve %, 0 = off
+let FILTER_SORT = "";             // "" | "level" | "type" | "solve_desc" | "solve_asc"
+
+function currentFilterRecord() {
+  if (FILTER_IDX < 0 || FILTER_IDX >= FILTER_FILTERED.length) return null;
+  return FILTER_FILTERED[FILTER_IDX];
+}
+
+// Does a record pass the active facet scope? (Threshold applied separately.)
+function filterMatchesScope(r) {
+  for (const key of Object.keys(FILTER_FACETS)) {
+    const want = FILTER_FACETS[key];
+    if (want && want.size && !want.has(String(r[key] ?? "").trim())) return false;
+  }
+  return true;
+}
+
+// The whitelist: records passing the active facets, then the solve-% threshold
+// (which hides — and on Apply rejects — not-yet-evaluated "n/a" problems), then
+// the sort order.
+function filteredOriginals() {
+  const recs = FILTER_RECORDS.filter(r => {
+    if (!filterMatchesScope(r)) return false;
+    if (FILTER_THRESHOLD > 0) {
+      const pct = solvePct(r);
+      if (pct == null || pct < FILTER_THRESHOLD) return false;
+    }
+    return true;
+  });
+  if (FILTER_SORT === "level") {
+    return [...recs].sort((a, b) =>
+      String(a.level || "").localeCompare(String(b.level || ""), undefined, { numeric: true }));
+  }
+  if (FILTER_SORT === "type") {
+    return [...recs].sort((a, b) => String(a.type || "").localeCompare(String(b.type || "")));
+  }
+  if (FILTER_SORT === "solve_desc" || FILTER_SORT === "solve_asc") {
+    const dir = FILTER_SORT === "solve_desc" ? -1 : 1;
+    return [...recs].sort((a, b) => {
+      const pa = solvePct(a), pb = solvePct(b);
+      if (pa == null && pb == null) return 0;
+      if (pa == null) return 1;   // n/a sinks to the bottom either direction
+      if (pb == null) return -1;
+      return dir * (pa - pb);
+    });
+  }
+  return recs;
+}
+
+// Level (natural sort) + Subject(type) facet definitions from the filter pool.
+function filterFacetDefs() {
+  const levels = [...new Set(FILTER_RECORDS.map(r => (r.level || "").trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const subjects = [...new Set(FILTER_RECORDS.map(r => (r.type || "").trim()).filter(Boolean))].sort();
+  return [{ key: "level", label: "Level", values: levels },
+          { key: "type", label: "Subject", values: subjects }];
+}
+
+function toggleFilterFacet(key, value) {
+  if (!FILTER_FACETS[key]) FILTER_FACETS[key] = new Set();
+  const set = FILTER_FACETS[key];
+  if (set.has(value)) set.delete(value); else set.add(value);
+  if (!set.size) delete FILTER_FACETS[key];
+  refreshFilterSection({ reset: true });
+}
+
+function clearFilterFilters() {
+  for (const k of Object.keys(FILTER_FACETS)) delete FILTER_FACETS[k];
+  FILTER_THRESHOLD = 0;
+  FILTER_SORT = "";
+  refreshFilterSection({ reset: true });   // rebuilds the panel from state
+}
+
+// Renders the filters rail: a Clear button + count, the min-solve-% slider, then
+// the Level/Subject facet chips. All controls live here and are (re)wired on each
+// rebuild; the threshold slider avoids rebuilding the panel on input so a drag
+// isn't interrupted (it re-renders only the viewer via skipFacets).
+function renderFilterFacets() {
+  const panel = document.getElementById("filterFacets");
+  if (!panel) return;
+  const defs = filterFacetDefs().filter(f => f.values.length);
+  const groups = defs.map(f => {
+    const chips = f.values.map(v => {
+      const active = FILTER_FACETS[f.key] && FILTER_FACETS[f.key].has(v);
+      return `<button type="button" class="ds-chip${active ? " active" : ""}" ` +
+             `data-facet="${escapeHtml(f.key)}" data-value="${escapeHtml(v)}">${escapeHtml(v)}</button>`;
+    }).join("");
+    const count = FILTER_FACETS[f.key] ? FILTER_FACETS[f.key].size : 0;
+    return `<div class="ds-fgroup">
+        <div class="ds-fhead">${escapeHtml(f.label)}${count ? ` <span class="ds-fcount">${count}</span>` : ""}</div>
+        <div class="ds-chips">${chips}</div>
+      </div>`;
+  }).join("");
+  panel.innerHTML = `
+    <div class="ds-fhead-row">
+      <span class="ds-fpanel-title">Filters</span>
+      <button id="filterClear" type="button" class="ds-fclear">Clear</button>
+    </div>
+    <div class="ds-fcount-line"><span class="count" id="filterCount"></span></div>
+    <div class="ds-fgroup">
+      <div class="ds-fhead">Sort</div>
+      <select id="filterSort" class="ds-sort" aria-label="Sort filter pool">
+        <option value="">Sort: default</option>
+        <option value="level">Sort: Level</option>
+        <option value="type">Sort: Subject</option>
+        <option value="solve_desc">Sort: Solve % (high&rarr;low)</option>
+        <option value="solve_asc">Sort: Solve % (low&rarr;high)</option>
+      </select>
+    </div>
+    <div class="ds-fgroup">
+      <div class="ds-fhead">Min solve %</div>
+      <span class="batch-slider-wrap">
+        <input type="range" id="filterThreshold" class="batch-slider" min="0" max="100" step="5"
+               value="${FILTER_THRESHOLD}" aria-label="Minimum solve percentage" />
+        <span class="batch-pct-readout" id="filterThresholdReadout">${FILTER_THRESHOLD}%</span>
+      </span>
+    </div>
+    ${groups || `<div class="hint">No pulled problems yet.</div>`}`;
+  panel.querySelector("#filterClear").addEventListener("click", clearFilterFilters);
+  const sortSel = panel.querySelector("#filterSort");
+  sortSel.value = FILTER_SORT;
+  sortSel.addEventListener("change", () => {
+    FILTER_SORT = sortSel.value;
+    refreshFilterSection({ reset: true, skipFacets: true });
+  });
+  const thr = panel.querySelector("#filterThreshold");
+  const readout = panel.querySelector("#filterThresholdReadout");
+  thr.addEventListener("input", () => {
+    FILTER_THRESHOLD = Math.max(0, Math.min(100, parseInt(thr.value, 10) || 0));
+    readout.textContent = FILTER_THRESHOLD + "%";
+    refreshFilterSection({ reset: true, skipFacets: true });  // keep the slider element alive mid-drag
+  });
+  panel.querySelectorAll(".ds-chip").forEach(btn =>
+    btn.addEventListener("click", () => toggleFilterFacet(btn.dataset.facet, btn.dataset.value)));
+}
+
+// Current disposition of a filter-pool record → a viewer tag.
+function dispositionTag(rec) {
+  const s = rec.status || "";
+  if (s === "Filtered (kept)") return { text: "kept", kind: "kept" };
+  if (s === "Filtered (rejected)") return { text: "rejected", kind: "rejected" };
+  return { text: "unfiltered", kind: "aug" };
+}
+
+// Convert a filter-pool record into a ViewerModel carrying its disposition +
+// solve-% tags.
+function filterRecordToModel(rec) {
+  const orig = rec.original || {};
+  const tags = [];
+  if (rec.type) tags.push({ text: rec.type, kind: "type" });
+  if (rec.level) tags.push({ text: rec.level, kind: "level" });
+  tags.push(dispositionTag(rec));
+  tags.push(solveTag(rec));
+  tags.push(graderErrorTag(rec));
+  return {
+    id: rec.id ?? rec.problem_id ?? "—",
+    sourceAbbrev: sourceAbbrev(rec.source),
+    tags,
+    problem: orig.problem || rec.problem || "",
+    answer: orig.solution ?? rec.solution ?? rec.answer ?? "",
+    perturbations: null,
+    debugSample: (rec.evaluation && rec.evaluation.debug && rec.evaluation.debug.sample_response) || null,
+  };
+}
+
+function renderFilterCurrent() {
+  const total = FILTER_RECORDS.length;
+  const countEl = document.getElementById("filterCount");
+  if (countEl) countEl.textContent = `${FILTER_FILTERED.length} / ${total} shown`;
+  const rec = currentFilterRecord();
+  updateNav({ prev: "filterPrev", next: "filterNext", indicator: "filterIndicator", jump: "filterJump" },
+            FILTER_IDX, FILTER_FILTERED.length, rec ? (rec.problem_id ?? "") : "");
+  const viewer = document.getElementById("filterViewer");
+  if (viewer) {
+    if (!rec) {
+      viewer.innerHTML = total
+        ? '<div class="empty">No problems match your filters.</div>'
+        : '<div class="hint">Pull some problems first (with "Evaluate solvability" on to score them).</div>';
+    } else {
+      renderProblemDisplay(viewer, filterRecordToModel(rec));
+    }
+  }
+}
+
+// Recompute the working set + facets and re-render. opts.reset snaps to the first
+// match (facet/search/threshold change); otherwise the current record is kept in
+// view when it survives the filter (e.g. after evaluating it in place).
+function refreshFilterSection(opts) {
+  opts = opts || {};
+  const keep = opts.reset ? null : currentFilterRecord();
+  FILTER_FILTERED = BACKEND ? filteredOriginals() : [];
+  if (keep) {
+    const i = FILTER_FILTERED.indexOf(keep);
+    FILTER_IDX = i >= 0 ? i
+      : (FILTER_FILTERED.length ? Math.min(Math.max(FILTER_IDX, 0), FILTER_FILTERED.length - 1) : -1);
+  } else {
+    FILTER_IDX = FILTER_FILTERED.length ? 0 : -1;
+  }
+  if (!opts.skipFacets) renderFilterFacets();
+  renderFilterCurrent();
+}
+
+function stepFilter(delta) {
+  if (!FILTER_FILTERED.length) return;
+  FILTER_IDX = Math.min(FILTER_FILTERED.length - 1, Math.max(0, FILTER_IDX + delta));
+  renderFilterCurrent();
+}
+
+// Commit the current filter partition (the whitelist gate). Everything passing
+// the active filters → Kept (→ Generate); every other pool record → Rejected.
+async function applyFilter() {
+  if (!BACKEND) { setStatus("filterApplyStatus", "Backend not detected.", "err"); return; }
+  if (!FILTER_RECORDS.length) {
+    setStatus("filterApplyStatus", "Nothing to filter — pull some problems first.", "err");
+    return;
+  }
+  const keepSet = new Set(filteredOriginals().map(r => r.problem_id));
+  const keep = [...keepSet];
+  const reject = FILTER_RECORDS.filter(r => !keepSet.has(r.problem_id)).map(r => r.problem_id);
+  // Warn specifically about un-evaluated problems that Apply would reject (a
+  // threshold > 0 hides "solve n/a" rows, so they land in the reject set).
+  const naRejected = FILTER_RECORDS.filter(
+    r => !keepSet.has(r.problem_id) && solvePct(r) == null).length;
+  const msg = `Apply filters?\n\n` +
+    `• Keep (→ Generate): ${keep.length}\n` +
+    `• Reject: ${reject.length}` +
+    (naRejected ? `  (${naRejected} not yet evaluated)` : "") +
+    `\n\nKept problems move to Generate; rejected ones are excluded (reversible by re-applying).`;
+  if (!window.confirm(msg)) return;
+
+  const btn = document.getElementById("filterApplyBtn");
+  if (btn) btn.disabled = true;
+  setStatus("filterApplyStatus", "Applying…", "");
+  try {
+    const data = await (await fetch("/api/apply_filter", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keep, reject }),
+    })).json();
+    if (!data.ok) { setStatus("filterApplyStatus", "Error: " + (data.error || "apply failed"), "err"); return; }
+    setStatus("filterApplyStatus",
+      `Applied — ${data.kept} kept, ${data.rejected} rejected.`, "ok");
+    await loadFilterPool();      // reflect new dispositions in the Filter pool
+    await populateBaseSelect();  // Generate now sees the newly-kept problems
+    await refreshBrowse();       // Browse = Kept + Verified
+  } catch (e) {
+    setStatus("filterApplyStatus", "Request failed: " + e.message, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 document.getElementById("navBrowse").addEventListener("click", () => showTab("browse"));
 document.getElementById("navCreate").addEventListener("click", () => showTab("create"));
 document.getElementById("refreshPending").addEventListener("click", loadPending);
@@ -1632,8 +2246,21 @@ document.getElementById("verifyApprove").addEventListener("click", () => runVeri
 document.getElementById("verifyReject").addEventListener("click", () => runVerifyBatch("reject"));
 document.getElementById("dsPrev").addEventListener("click", () => stepDataset(-1));
 document.getElementById("dsNext").addEventListener("click", () => stepDataset(1));
-document.getElementById("dsPull").addEventListener("click", () =>
-  runBatch(pullSection, { emptyMsg: "Nothing to pull — every matching problem is already pulled." }));
+document.getElementById("dsPull").addEventListener("click", () => {
+  PULLED_PIDS = [];   // fresh batch — the eval phase consumes only this pull's ids
+  runBatch(pullSection, { emptyMsg: "Nothing to pull — every matching problem is already pulled." });
+});
+// "Evaluate solvability" toggle in Pull — persist across reloads.
+(() => {
+  const t = document.getElementById("pullEval");
+  if (!t) return;
+  t.checked = localStorage.getItem("pullEval") === "1";
+  t.addEventListener("change", () => localStorage.setItem("pullEval", t.checked ? "1" : "0"));
+})();
+document.getElementById("filterPrev").addEventListener("click", () => stepFilter(-1));
+document.getElementById("filterNext").addEventListener("click", () => stepFilter(1));
+document.getElementById("filterApplyBtn").addEventListener("click", applyFilter);
+document.getElementById("filterRefresh").addEventListener("click", () => loadFilterPool());
 // Build the shared batch controls for each section (hosts exist in index.html).
 pullSection.batch = createBatchControl("pullBatch",
   { onChange: updatePullButton, getTotal: () => pullSection.getEligible().length });
@@ -1647,19 +2274,18 @@ wireJump("verifyJump", "verifyJumpGo", () => PENDING_GROUPS.length,
   (i) => { VERIFY_IDX = i; updateVerifyNav(); });
 wireJump("dsJump", "dsJumpGo", () => DS.filtered.length,
   (i) => { DS.idx = i; renderDatasetCurrent(); });
+wireJump("filterJump", "filterJumpGo", () => FILTER_FILTERED.length,
+  (i) => { FILTER_IDX = i; renderFilterCurrent(); });
 document.getElementById("dsSearch").addEventListener("input", (e) => {
   DS.search = e.target.value;
   renderDatasetBrowser();
 });
-document.getElementById("dsSort").addEventListener("change", (e) => {
-  DS.sort = e.target.value;
-  renderDatasetBrowser();
-});
-document.getElementById("dsClear").addEventListener("click", clearDatasetFilters);
 document.getElementById("dsReload").addEventListener("click", () => {
   if (DS.current) { delete DS.cache[DS.current]; selectDataset(DS.current); }
 });
+// (filter search removed; threshold slider + Clear are wired inside renderFilterFacets)
 document.getElementById("savePerturbation").addEventListener("click", savePerturbation);
+document.getElementById("verifyEvalBtn").addEventListener("click", evalCurrentPending);
 document.getElementById("llmGenerateBtn").addEventListener("click", llmGenerate);
 document.getElementById("generateRefresh").addEventListener("click", refreshGenerateSection);
 // Model selection (delegated — cards are re-rendered). GPU cards are static.
@@ -1686,6 +2312,7 @@ document.getElementById("createAuthor").addEventListener("input", () => {
 });
 
 (async () => {
+  syncHeaderHeight();
   buildGenModeNav(); // selector buttons + default Manual Creation panel
   // Load the source→abbrev map first so the initial Browse render shows
   // "{ABBR} #{id}" rather than the raw source name.

@@ -53,3 +53,32 @@ export GPU_SSH=""
 # shared, root-owned system service it auto-schedules GPUs and can't be pinned
 # per request, so the panel just highlights the GPU it's most likely to use (the
 # most-free card). GPU_SSH above is all that's needed (for the nvidia-smi readout).
+
+# --- CoTSimilarity sample evaluation (optional). ---
+# The authoring app can score pulled/verified samples with the CoTSimilarity /
+# DSPR model running on the SAME remote host (see cot_eval_service/README.md).
+# The backend forwards this port over the SAME SSH tunnel it opens for Ollama, so
+# no extra SSH config is needed — just run the shim on the remote:
+#
+#   cd <CoTSimilarity repo root>   # e.g. /scratch/<user>/DSPR
+#   pip install -r cot_eval_service/requirements-shim.txt
+#   export DEEPSEEK_API_KEY=...    # ON THE REMOTE — enables the GED score only
+#   uvicorn cot_eval_service.app:app --host 127.0.0.1 --port 8100 --workers 1
+#
+#   COT_EVAL_PORT  remote shim port AND local forward port (default 8100).
+#   COT_EVAL_N     samples per variant for the solvability pass-rate (default 10).
+#                  Timing tests found n=10 (30 vLLM generations per pair-eval:
+#                  10 each for original/simple/hard) averaged 88-113s/problem
+#                  regardless of GED model — n is the dominant cost, not GED.
+#                  Lower to 5 if you need to stay near ~1min/problem.
+#   COT_EVAL_HOST  override the URL the app POSTs to (default http://localhost:$COT_EVAL_PORT).
+export COT_EVAL_PORT="8100"
+export COT_EVAL_N="5"
+# export COT_EVAL_HOST="http://localhost:8100"
+
+# After editing cot_eval_service/app.py locally, redeploy with one command:
+#   ./scripts/deploy_eval_shim.sh
+# It scp's cot_eval_service/ to REMOTE_DSPR_DIR and restarts uvicorn there via
+# cot_eval_service/restart.sh (which sources ~/.cot_eval_env on the remote for
+# GED secrets — create that file once by hand, see restart.sh's header).
+REMOTE_DSPR_DIR=""   # e.g. "/scratch/<user>/DSPR" (the CoTSimilarity repo root)

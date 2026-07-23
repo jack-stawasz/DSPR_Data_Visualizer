@@ -20,7 +20,6 @@
   </div>
   <div class="controls" id="browseControls">
     <input type="text" id="search" placeholder="Search by ID or text..." />
-    <select id="typeFilter"><option value="">All types</option></select>
     <button id="toggleAllBtn">Show all answers</button>
     <span class="count" id="count"></span>
   </div>
@@ -28,8 +27,13 @@
 </header>
 <main>
   <div id="browseView" class="view">
-    <div id="list"></div>
-    <div class="empty hidden" id="empty">No problems match your filters.</div>
+    <div class="ds-layout">
+      <aside class="ds-filters" id="browseFacets"></aside>
+      <div class="ds-main">
+        <div id="list"></div>
+        <div class="empty hidden" id="empty">No problems match your filters.</div>
+      </div>
+    </div>
   </div>
 
   <div id="createView" class="view hidden">
@@ -40,27 +44,20 @@
           <h2 class="step-title" style="margin:0">Pull</h2>
           <button id="dsReload" type="button" style="margin-left:auto">Refresh</button>
         </div>
-        <p class="hint">Browse a source dataset, filter and sort, then pull individual problems into
-          <code class="kbd">data/DSPR_dataset.json</code> (status: Original) &mdash; you author the perturbations in step 2.</p>
+        <p class="hint">Browse a source dataset, then pull individual problems into
+          <code class="kbd">data/DSPR_dataset.json</code> (status: Original) &mdash; you cull them in the Filter step next.</p>
 
         <!-- Dataset source tabs — built by JS from /api/datasets. -->
         <div class="ds-tabs" id="dsTabs"></div>
         <div class="ds-desc muted" id="dsDesc"></div>
 
-        <!-- Search + sort + clear, mirroring the Projects page controls. -->
         <div class="ds-controls">
           <input type="text" id="dsSearch" class="ds-search" placeholder="Search problems…" aria-label="Search problems" />
-          <select id="dsSort" class="ds-sort" aria-label="Sort records">
-            <option value="">Sort: default</option>
-          </select>
-          <button id="dsClear" type="button">Clear filters</button>
-          <span class="count" id="dsCount"></span>
         </div>
 
-        <div class="ds-layout">
-          <!-- Filter panel — facet groups built dynamically per dataset. -->
-          <aside class="ds-filters" id="dsFilters"></aside>
-          <!-- Single focused problem, navigated one at a time (shared Problem Viewer). -->
+        <div class="ds-layout single">
+          <!-- Single focused problem, navigated one at a time (shared Problem Viewer).
+               Facet filtering lives in the Filter step below, not here. -->
           <div class="ds-main">
             <div class="pv-nav">
               <button id="dsPrev" type="button">&larr; Prev</button>
@@ -77,26 +74,86 @@
             <div class="save-row">
               <button id="dsPull" class="btn-accent" disabled>Pull this problem &rarr;</button>
               <div class="batch-ctl" id="pullBatch"></div>
+              <label class="toggle" title="After pulling, score each problem's solvability on the remote model (CoTSimilarity)">
+                <input type="checkbox" id="pullEval" class="switch-input" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                Evaluate solvability
+              </label>
             </div>
           </div>
         </div>
         <div class="gen-progress-wrap hidden" id="pullProgressWrap">
           <div class="gen-progress-bar" id="pullProgressBar"></div>
         </div>
+        <!-- Eval phase (toggle on): outer bar = problems, inner bar = sampling trials. -->
+        <div class="eval-progress hidden" id="pullEvalWrap">
+          <div class="eval-progress-row">
+            <span class="eval-progress-label" id="pullEvalProblemLabel">Evaluating…</span>
+            <div class="gen-progress-wrap"><div class="gen-progress-bar" id="pullEvalProblemBar"></div></div>
+          </div>
+          <div class="eval-progress-row">
+            <span class="eval-progress-label" id="pullEvalTrialLabel">Trials</span>
+            <div class="gen-progress-wrap"><div class="gen-progress-bar" id="pullEvalTrialBar"></div></div>
+          </div>
+        </div>
+        <div class="status" id="pullEvalStatus"></div>
         <div class="status" id="pullStatus"></div>
       </div>
     </div>
 
-    <!-- Step 2: Author perturbations -->
+    <!-- Step 2: Filter — cull pulled problems by solve-rate / subject / level,
+         then Apply to whitelist (Kept) / blacklist (Rejected). Solvability is
+         scored at Pull time (toggle there), not here. -->
+    <div id="tabFilter" class="ctab">
+      <div class="section">
+        <div class="card-head" style="margin-bottom:4px">
+          <h2 class="step-title" style="margin:0">Filter</h2>
+          <button id="filterRefresh" type="button" style="margin-left:auto">Refresh</button>
+        </div>
+        <p class="hint">Narrow the pulled pool by <b>minimum solve&nbsp;%</b>, subject, and level, then
+          <b>Apply filters</b> to keep the survivors (&rarr; Generate) and reject the rest. Solvability
+          scores come from the "Evaluate solvability" toggle in the Pull step.</p>
+
+        <div class="ds-layout">
+          <!-- Filters rail: solve-% threshold slider + Clear + facet groups
+               (Level / Subject) derived from the pulled Originals; all rendered
+               by renderFilterFacets(). -->
+          <aside class="ds-filters" id="filterFacets"></aside>
+          <div class="ds-main">
+            <div class="pv-nav">
+              <button id="filterPrev" type="button">&larr; Prev</button>
+              <span id="filterIndicator" class="nav-indicator">&mdash;</span>
+              <button id="filterNext" type="button">Next &rarr;</button>
+              <span class="nav-jump">
+                <input type="number" id="filterJump" class="nav-jump-input" min="1" placeholder="#" aria-label="Jump to problem index" />
+                <button id="filterJumpGo" type="button">Go</button>
+              </span>
+            </div>
+
+            <div id="filterViewer" class="pv-host">
+              <div class="hint">Pull some problems (with "Evaluate solvability" on) to score them, then filter here.</div>
+            </div>
+            <div class="save-row">
+              <button id="filterApplyBtn" class="btn-accent"
+                title="Whitelist the problems passing the current filters as Kept (→ Generate) and reject the rest">Apply filters &rarr;</button>
+              <span class="status" id="filterApplyStatus"></span>
+            </div>
+          </div>
+        </div>
+        <div class="status" id="filterStatus"></div>
+      </div>
+    </div>
+
+    <!-- Step 3: Author perturbations -->
     <div id="tabCreate" class="ctab">
       <div class="section">
         <div class="card-head" style="margin-bottom:4px">
           <h2 class="step-title" style="margin:0">Generate</h2>
           <button id="generateRefresh" type="button" style="margin-left:auto">Refresh</button>
         </div>
-        <p class="hint">Pick a base problem (status: Original in <code class="kbd">data/DSPR_dataset.json</code>), then author a
+        <p class="hint">Pick a base problem (Kept problems that passed the Filter step, in <code class="kbd">data/DSPR_dataset.json</code>), then author a
           <b>simple</b> and <b>hard</b> variant manually or generate them with an LLM.
-          Saving adds them with status Unverified for review in step 3.</p>
+          Saving adds them with status Unverified for review in the Verify step.</p>
         <!-- Generation mode selector — buttons are built by JS from GEN_MODES. -->
         <div class="subnav" id="genModeNav"></div>
         <div class="status" id="generateStatus"></div>
@@ -157,7 +214,9 @@
             <div class="save-row">
               <button id="savePerturbation" class="btn-accent">Save Perturbation</button>
               <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
-                <input type="checkbox" id="autoVerify" /> Auto-verify
+                <input type="checkbox" id="autoVerify" class="switch-input" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                Auto-verify
                 <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>
               </label>
             </div>
@@ -177,7 +236,9 @@
                 title="Generate simple + hard perturbations for this problem with the selected model">LLM Generation</button>
               <div class="batch-ctl" id="genBatch"></div>
               <label class="toggle" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">
-                <input type="checkbox" id="llmAutoVerify" /> Auto-verify
+                <input type="checkbox" id="llmAutoVerify" class="switch-input" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                Auto-verify
                 <span class="info" title="Skip review and save straight to data/DSPR_dataset.json (status: Verified)">i</span>
               </label>
             </div>
@@ -191,7 +252,7 @@
       </div>
     </div>
 
-    <!-- Step 3: Verify -->
+    <!-- Step 4: Verify -->
     <div id="tabVerify" class="ctab">
       <div class="section">
         <div class="card-head" style="margin-bottom:4px">
@@ -220,6 +281,12 @@
           </div>
         </div>
         <div id="verifyList"></div>
+        <!-- CoTSimilarity pair eval: solvability + reasoning-structure similarity. -->
+        <div class="eval-row">
+          <button id="verifyEvalBtn" type="button"
+            title="Evaluate solvability of each variant and the reasoning-structure similarity (GED) of simple/hard vs the original (CoTSimilarity)">Evaluate pair (CoTSimilarity)</button>
+          <span class="status" id="verifyEvalStatus"></span>
+        </div>
         <div class="save-row">
           <button id="verifyApprove" class="btn-accent" disabled>Approve pair &rarr; verified</button>
           <button id="verifyReject" disabled>Reject pair</button>
