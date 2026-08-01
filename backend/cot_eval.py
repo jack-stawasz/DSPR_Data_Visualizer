@@ -154,3 +154,31 @@ def eval_pair(record: dict, n: int = None) -> dict:
         },
     }
     return _post("/eval/pair", payload)
+
+
+def eval_graph(record: dict, variant: str, n: int = 1) -> dict:
+    """Reasoning DAG (raw + compressed) for ONE variant, with no GED computed.
+
+    Drives the pre-GED graph preview: the caller loops original/simple/hard so the
+    UI can report per-variant progress (the shim has no multi-variant graph
+    endpoint for the same reason /eval/solvability is called one trial at a time).
+    Returns the shim's dict — {pass_rate, n, model, response, steps, dag, raw,
+    compressed, error} — verbatim; extraction failures arrive as "error", not as
+    an exception.
+    """
+    if variant not in ("original", "simple", "hard"):
+        raise RuntimeError(f"unknown variant {variant!r}")
+    is_original = variant == "original"
+    part = record.get(variant) or {}
+    problem = (part.get("problem")
+               or (record.get("problem") if is_original else "")
+               or "").strip()
+    if not problem:
+        raise RuntimeError(f"record has no {variant} problem text to graph")
+    payload = {
+        "problem": problem,
+        "ground_truth": str(_ground_truth(part, record, is_original=is_original)),
+        "n": max(1, int(n or 1)),
+        "dataset_type": "original" if is_original else "perturb",
+    }
+    return _post("/eval/graph", payload)

@@ -12,6 +12,14 @@ It exposes:
 | `GET /health` | `{model, cuda, ged_ready}` — readiness probe |
 | `POST /eval/solvability` | pass-rate of the vLLM math model on one problem (Pull step) |
 | `POST /eval/pair` | solvability of original/simple/hard **+** GED structural similarity of simple & hard vs the original (Verify step) |
+| `POST /eval/graph` | one variant's reasoning DAG (`raw` + `compressed`, plus the steps and the trace they came from) with **no GED** — the pre-GED preview the Verify step draws |
+
+`/eval/graph` runs the same pipeline `/eval/pair` feeds into GED (sample → pick a
+representative trace → segment → LLM-tag → compress) but returns the graphs
+instead of scoring them, so the extraction can be inspected before it is trusted.
+It defaults to `n=1` (one trace is all a graph needs), which makes it far cheaper
+than a pair eval's 3 × N. A failed extraction comes back as `error` with null
+graphs rather than a 500.
 
 ## Deploy (on the remote GPU host)
 
@@ -48,6 +56,11 @@ curl localhost:8100/health
 curl -s -XPOST localhost:8100/eval/solvability \
   -H 'content-type: application/json' \
   -d '{"problem":"What is 2+2?","ground_truth":"4","n":2}'
+
+# graph preview — expect non-empty steps/dag and a compressed graph no larger than raw
+curl -s -XPOST localhost:8100/eval/graph \
+  -H 'content-type: application/json' \
+  -d '{"problem":"What is 2+3*4?","ground_truth":"14","n":1,"dataset_type":"original"}'
 ```
 
 ## What it imports from the repo

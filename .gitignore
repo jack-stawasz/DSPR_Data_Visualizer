@@ -5,12 +5,22 @@ ollama.local.sh
 # Personal CoT-eval GED config (holds a real Gemini API key) — never committed.
 # Copy cot_eval.local.sh.example -> cot_eval.local.sh and fill it in.
 cot_eval.local.sh
+cot_eval.local.sh.bak*
+
+# Log files from local runs — never contain anything worth tracking.
+*.log
 
 # Disposable local virtualenv (rebuilt by start.sh from requirements.txt).
 venv/
 
 # Python bytecode caches.
 __pycache__/
+
+# Reasoning-graph previews (scripts/backfill_graphs.py). Diagnostic snapshots of
+# one sampled trace each, ~10 MB for the full Verified pool and regenerable at
+# will — and NOT reproducible (temperature-1.0 sampling), so pinning them in git
+# history would freeze noise, not facts.
+data/graph_previews/
 
 # Throwaway one-off scripts/logs/data dumps (underscore-prefixed convention).
 backend/_*

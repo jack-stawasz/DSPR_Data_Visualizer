@@ -285,6 +285,8 @@
         <div class="eval-row">
           <button id="verifyEvalBtn" type="button"
             title="Evaluate solvability of each variant and the reasoning-structure similarity (GED) of simple/hard vs the original (CoTSimilarity)">Evaluate pair (CoTSimilarity)</button>
+          <button id="verifyGraphBtn" type="button"
+            title="Extract and draw the reasoning DAG of each variant WITHOUT computing GED, so the extraction can be inspected first">Preview reasoning graphs</button>
           <span class="status" id="verifyEvalStatus"></span>
         </div>
         <div class="save-row">
@@ -296,5 +298,26 @@
     </div>
   </div>
 </main>
+
+<!-- Reasoning-graph preview: the DAGs that FEED the GED, shown before it is computed.
+     Compressed is what compute_ged_similarity actually scores; raw is what the LLM
+     extracted, and the difference between them explains most surprising scores. -->
+<div id="graphModal" class="graph-modal hidden" role="dialog" aria-modal="true" aria-labelledby="graphModalTitle">
+  <div class="graph-modal-backdrop" id="graphModalBackdrop"></div>
+  <div class="graph-modal-panel">
+    <div class="graph-modal-head">
+      <h2 id="graphModalTitle">Reasoning graphs</h2>
+      <div class="seg" id="graphModeToggle" role="group" aria-label="Graph view">
+        <button type="button" data-mode="compressed" class="active">Compressed</button>
+        <button type="button" data-mode="raw">Raw</button>
+      </div>
+      <span class="hint" id="graphModeHint"></span>
+      <button type="button" id="graphModalClose" class="graph-modal-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="dag-legend" id="graphLegend"></div>
+    <div class="graph-cols" id="graphCols"></div>
+    <div class="graph-detail" id="graphDetail"></div>
+  </div>
+</div>
 </body>
 </html>

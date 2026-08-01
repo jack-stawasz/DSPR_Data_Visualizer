@@ -104,6 +104,9 @@ function onLoaded(recs, source) {
   renderBrowseFacets();
   render();
   requestAnimationFrame(syncHeaderHeight);
+  // Reasoning-graph coverage badges load separately and re-render once in —
+  // Browse shouldn't wait on this (or block on it failing) to show records.
+  loadGraphIndex().then(idx => { GRAPH_INDEX = idx; render(); });
 }
 
 // --------------------------------------------------------------------------
@@ -658,6 +661,7 @@ function render() {
           ${r.create_author ? `<span class="badge author">${escapeHtml(r.create_author)}</span>` : ""}
           ${r.verify_author ? `<span class="badge verifier">${escapeHtml(r.verify_author)}</span>` : ""}
           ${renderTags([solveTag(r), graderErrorTag(r)])}
+          ${graphCoverageBadge(r)}
         </div>
         <div class="variants">
           ${originalBlock}
@@ -1972,6 +1976,343 @@ async function evalCurrentPending() {
 }
 
 // --------------------------------------------------------------------------
+// Reasoning-graph preview — the DAGs that FEED the GED, drawn before it runs.
+//
+// GED is otherwise a black box: a surprising score could mean the perturbation
+// really changed the reasoning structure, or that segmentation/LLM tagging/
+// compression misfired. This renders the same graphs /eval/pair builds and
+// discards, so the extraction can be judged (and the pair eval skipped) first.
+// The backend keeps previews in memory only — they are diagnostic, not results.
+// --------------------------------------------------------------------------
+const DAG_TAGS = ["Define", "Recall", "Derive", "Calculate", "Verify", "Conclude"];
+const GRAPH_VARIANTS = ["original", "simple", "hard"];
+const GRAPH_MODE_HINT = {
+  compressed: "Same-tag chains contracted and parallel layers folded — this is what GED scores.",
+  raw: "The LLM's per-step extraction, before compression.",
+};
+
+let GRAPH_PREVIEW = { pid: null, payload: null, mode: "compressed", selected: null };
+
+// Which Verified records have a stored preview, and how complete each is —
+// {problem_id (string) -> {graphed, total, carried, generated_at}}. Loaded once
+// per Browse render so cards can badge/gate the "View reasoning graphs" button
+// WITHOUT it ever silently kicking off a several-minute GPU job.
+let GRAPH_INDEX = null;
+
+async function loadGraphIndex() {
+  if (!BACKEND) return {};
+  try {
+    const data = await (await fetch("/api/eval_graphs_index")).json();
+    return data.index || {};
+  } catch (e) { return {}; }
+}
+
+// Badge for a Browse card: only rendered when a preview is already stored (the
+// button opens the CACHED payload — Browse never triggers generation, that stays
+// a deliberate action in the Verify tab).
+function graphCoverageBadge(rec) {
+  const pid = rec && rec.problem_id;
+  const cov = pid != null && GRAPH_INDEX ? GRAPH_INDEX[String(pid)] : null;
+  if (!cov || !cov.graphed) return "";
+  const kind = cov.graphed === cov.total ? "ok" : "warn";
+  return `<button type="button" class="badge eval ${kind} graph-view-btn" data-pid="${escapeHtml(String(pid))}"
+            title="Stored reasoning-graph preview — click to view">graphs ${cov.graphed}/${cov.total}</button>`;
+}
+
+// Open a STORED preview only — never starts generation. Used by Browse, where
+// the coverage badge already guarantees a cached payload exists.
+async function openStoredGraphs(pid) {
+  try {
+    const data = await (await fetch(`/api/eval_graphs?problem_id=${encodeURIComponent(pid)}`)).json();
+    if (data.cached && data.graphs) { openGraphModal(data.graphs, pid); return; }
+  } catch (e) { /* fall through */ }
+  window.alert("No stored preview for this record (it may have been generated in a since-restarted session).");
+}
+
+// Enqueue (or reuse) a graph preview for the current pending record, then show it.
+async function previewCurrentGraphs() {
+  const rec = verifySection.getCurrent();
+  if (!rec) { setStatus("verifyEvalStatus", "No pending problem selected.", "err"); return; }
+  const pid = rec.problem_id;
+  if (pid == null) { setStatus("verifyEvalStatus", "This record has no problem_id.", "err"); return; }
+  const btn = document.getElementById("verifyGraphBtn");
+  if (btn) btn.disabled = true;
+  try {
+    // Same session, same record → serve the cached payload, no GPU work.
+    if (GRAPH_PREVIEW.pid === pid && GRAPH_PREVIEW.payload) { openGraphModal(GRAPH_PREVIEW.payload); return; }
+    if (!BACKEND) { setStatus("verifyEvalStatus", "Backend not detected — start the server first.", "err"); return; }
+    let cached = null;
+    try {
+      const data = await (await fetch(`/api/eval_graphs?problem_id=${encodeURIComponent(pid)}`)).json();
+      if (data.cached) cached = data.graphs;
+    } catch (e) { /* fall through to a fresh run */ }
+    if (cached) { openGraphModal(cached, pid); return; }
+
+    setStatus("verifyEvalStatus", "Connecting to the eval service…", "");
+    if (!(await ensureEvalReady())) {
+      setStatus("verifyEvalStatus", "Eval service unavailable: " + (EVAL_STATUS.reason || "unreachable"), "err");
+      return;
+    }
+    const started = await (await fetch("/api/eval_record", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ problem_id: pid, kind: "graphs" }),
+    })).json();
+    if (!started.ok) { setStatus("verifyEvalStatus", "Error: " + started.error, "err"); return; }
+    const result = await pollGraphsUntilDone(pid);
+    if (result.state !== "done" || !result.graphs) {
+      setStatus("verifyEvalStatus",
+        "Graph preview failed: " + (result.error || "no graphs returned"), "err");
+      return;
+    }
+    const warns = result.graphs.warnings || [];
+    setStatus("verifyEvalStatus", warns.length ? "Graphs ready, with warnings." : "Graphs ready.",
+      warns.length ? "" : "ok");
+    openGraphModal(result.graphs, pid);
+  } catch (e) {
+    setStatus("verifyEvalStatus", "Request failed: " + e.message, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Poll a graphs job, reporting the per-variant progress the worker publishes.
+async function pollGraphsUntilDone(pid) {
+  for (let i = 0; i < 450; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    let data;
+    try {
+      data = await (await fetch(`/api/eval_status?problem_id=${encodeURIComponent(pid)}`)).json();
+    } catch (e) { return { state: "error", error: "lost connection to the backend" }; }
+    const p = data.progress;
+    if (p && p.variants) {
+      setStatus("verifyEvalStatus",
+        `Extracting reasoning graphs on the GPU host — variant ${p.variant}/${p.variants}…`, "");
+    }
+    if (data.state && !["queued", "running"].includes(data.state)) return data;
+  }
+  return { state: "error", error: "graph preview timed out (still running on the server)" };
+}
+
+// ---- layout -------------------------------------------------------------- //
+// Longest-path layering: a node sits one level below its deepest dependency.
+// Edges run dependency -> dependent, so level 0 holds the problem node, any
+// "External" node, and anything else with no incoming edge.
+function layoutDag(graph) {
+  const nodes = (graph && graph.nodes) || [];
+  const links = (graph && graph.links) || [];
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const level = new Map(nodes.map(n => [n.id, 0]));
+  const edges = links.filter(l => byId.has(l.source) && byId.has(l.target));
+  // Relax at most |nodes| times: a DAG settles sooner, and the cap keeps a
+  // malformed (cyclic) graph from spinning forever.
+  for (let pass = 0; pass < nodes.length; pass++) {
+    let moved = false;
+    for (const l of edges) {
+      const want = level.get(l.source) + 1;
+      if (level.get(l.target) < want) { level.set(l.target, want); moved = true; }
+    }
+    if (!moved) break;
+  }
+  const rows = [];
+  for (const n of nodes) {
+    const lv = level.get(n.id);
+    (rows[lv] = rows[lv] || []).push(n);
+  }
+  for (const row of rows) if (row) row.sort((a, b) => dagNodeOrder(a) - dagNodeOrder(b));
+  return { rows: rows.map(r => r || []), edges, byId };
+}
+
+// Sort key within a row: the problem node first, then steps by id, External last.
+function dagNodeOrder(node) {
+  if (node.type === "problem") return -1;
+  if (node.type === "external") return 1e9;
+  const n = Number(node.id);
+  return Number.isFinite(n) ? n : 1e8;
+}
+
+// Every step id a node stands for: itself plus anything compression folded in.
+function dagNodeIds(node) {
+  const ids = [String(node.id)].concat((node.absorbed_nodes || []).map(String));
+  return [...new Set(ids)].sort((a, b) => (Number(a) || 0) - (Number(b) || 0));
+}
+
+function dagNodeLabel(node) {
+  if (node.type === "problem") return "P";
+  if (node.type === "external") return "Ext";
+  const ids = dagNodeIds(node);
+  // Merged nodes can swallow a lot of steps; keep the chip readable.
+  return ids.length > 3 ? `${ids[0]}+${ids.length - 1}` : ids.join(",");
+}
+
+function dagNodeClass(node) {
+  if (node.type === "problem") return "node-problem";
+  if (node.type === "external") return "node-external";
+  const tag = node.macro_action_tag;
+  return DAG_TAGS.includes(tag) ? `tag-${tag}` : "node-untagged";
+}
+
+// ---- rendering ----------------------------------------------------------- //
+const DAG_W = 62, DAG_H = 28, DAG_HGAP = 16, DAG_VGAP = 46, DAG_PAD = 12;
+
+function dagSvg(graph, variant, steps) {
+  const { rows, edges, byId } = layoutDag(graph);
+  const nodes = (graph && graph.nodes) || [];
+  if (!nodes.length) return '<div class="empty">Empty graph.</div>';
+  const widest = Math.max(...rows.map(r => r.length), 1);
+  const width = DAG_PAD * 2 + widest * DAG_W + (widest - 1) * DAG_HGAP;
+  const height = DAG_PAD * 2 + rows.length * DAG_H + Math.max(0, rows.length - 1) * DAG_VGAP;
+  const pos = new Map();
+  rows.forEach((row, lv) => {
+    const rowW = row.length * DAG_W + (row.length - 1) * DAG_HGAP;
+    const x0 = (width - rowW) / 2;
+    row.forEach((n, i) => {
+      pos.set(n.id, { x: x0 + i * (DAG_W + DAG_HGAP), y: DAG_PAD + lv * (DAG_H + DAG_VGAP) });
+    });
+  });
+  const edgeSvg = edges.map(l => {
+    const a = pos.get(l.source), b = pos.get(l.target);
+    if (!a || !b) return "";
+    const x1 = a.x + DAG_W / 2, y1 = a.y + DAG_H;
+    const x2 = b.x + DAG_W / 2, y2 = b.y;
+    const mid = (y1 + y2) / 2;
+    return `<path class="dag-edge" d="M${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}" marker-end="url(#dagArrow)"/>`;
+  }).join("");
+  const nodeSvg = nodes.map(n => {
+    const p = pos.get(n.id);
+    if (!p) return "";
+    return `<g class="dag-node ${dagNodeClass(n)}" data-variant="${escapeHtml(variant)}" data-node-id="${escapeHtml(n.id)}"
+              transform="translate(${p.x},${p.y})" tabindex="0">
+        <title>${escapeHtml(dagNodeTooltip(n, steps))}</title>
+        <rect width="${DAG_W}" height="${DAG_H}" rx="6"/>
+        <text x="${DAG_W / 2}" y="${DAG_H / 2 + 4}" text-anchor="middle">${escapeHtml(dagNodeLabel(n))}</text>
+      </g>`;
+  }).join("");
+  return `<svg class="dag-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img">
+      <defs>
+        <marker id="dagArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0 0 L8 4 L0 8 z"/>
+        </marker>
+      </defs>
+      ${edgeSvg}${nodeSvg}
+    </svg>`;
+}
+
+// Plain-text hover summary. The click handler shows the same content with math
+// typeset; this keeps a zero-JS fallback on every node.
+function dagNodeTooltip(node, steps) {
+  if (node.type === "problem") return "The problem statement (dependency root)";
+  if (node.type === "external") return "External knowledge — a formula or value not derived in the trace";
+  const ids = dagNodeIds(node);
+  const head = `Step ${ids.join(", ")}${node.macro_action_tag ? " · " + node.macro_action_tag : ""}`;
+  const text = ids.map(id => stepTextFor(steps, id)).filter(Boolean).join("\n\n");
+  const analysis = node.analysis ? `\n\nWhy: ${node.analysis}` : "";
+  return `${head}\n\n${text || "(step text unavailable)"}${analysis}`;
+}
+
+function stepTextFor(steps, id) {
+  const n = Number(id);
+  const hit = (steps || []).find(s => Number(s.index) === n);
+  return hit ? hit.text : "";
+}
+
+function openGraphModal(payload, pid) {
+  GRAPH_PREVIEW.payload = payload;
+  if (pid != null) GRAPH_PREVIEW.pid = pid;
+  GRAPH_PREVIEW.selected = null;
+  document.getElementById("graphModal").classList.remove("hidden");
+  renderGraphModal();
+}
+
+function closeGraphModal() {
+  document.getElementById("graphModal").classList.add("hidden");
+}
+
+function renderGraphModal() {
+  const payload = GRAPH_PREVIEW.payload;
+  const mode = GRAPH_PREVIEW.mode;
+  const cols = document.getElementById("graphCols");
+  document.getElementById("graphModalTitle").textContent =
+    `Reasoning graphs — problem ${GRAPH_PREVIEW.pid ?? "—"}`;
+  document.getElementById("graphModeHint").textContent = GRAPH_MODE_HINT[mode];
+  document.getElementById("graphModeToggle").querySelectorAll("button")
+    .forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
+  document.getElementById("graphLegend").innerHTML =
+    DAG_TAGS.map(t => `<span class="dag-key tag-${t}">${t}</span>`).join("")
+    + '<span class="dag-key node-problem">problem</span>'
+    + '<span class="dag-key node-external">external</span>';
+  if (!payload) { cols.innerHTML = '<div class="empty">No graphs loaded.</div>'; return; }
+  cols.innerHTML = GRAPH_VARIANTS.map(v => graphColumn(v, payload.variants[v], mode)).join("");
+  // Re-mark the selected node — switching modes rebuilds the SVG, and the node
+  // may or may not survive compression.
+  const sel = GRAPH_PREVIEW.selected;
+  if (sel) {
+    const g = cols.querySelector(`.dag-node[data-variant="${CSS.escape(sel.variant)}"][data-node-id="${CSS.escape(sel.id)}"]`);
+    if (g) g.classList.add("selected");
+  }
+  renderGraphDetail();
+}
+
+function graphColumn(variant, data, mode) {
+  if (!data) return `<div class="graph-col"><div class="graph-col-head"><span class="vtag ${variant}">${variant}</span></div>
+    <div class="empty">Not run.</div></div>`;
+  const graph = data[mode];
+  const pct = data.pass_rate == null ? null : Math.round(data.pass_rate * 100);
+  const badges = [
+    pct == null ? "" : `<span class="badge eval ${passRateKind(pct)}">solve ${pct}%</span>`,
+    graph ? `<span class="badge">${graph.nodes.length} nodes · ${graph.links.length} edges</span>` : "",
+  ].join("");
+  const body = graph
+    ? dagSvg(graph, variant, data.steps)
+    : `<div class="empty">No graph — ${escapeHtml(data.error || "extraction failed")}</div>`;
+  const err = graph && data.error ? `<div class="graph-warn">${escapeHtml(data.error)}</div>` : "";
+  // A retry can succeed on one variant and regress another; the store keeps the
+  // better of the two per variant (app._graph_store_merge), so a record CAN mix
+  // graphs from two different backfill runs (and possibly two GED models). Say
+  // so, rather than let it look like all three came from one consistent pass.
+  const carried = graph && data.carried_over
+    ? `<div class="graph-carried">Kept from an earlier attempt — a later re-run of this record regressed this variant.</div>`
+    : "";
+  return `
+    <div class="graph-col">
+      <div class="graph-col-head"><span class="vtag ${variant}">${variant}</span>${badges}</div>
+      ${carried}
+      ${err}
+      <div class="dag-wrap">${body}</div>
+      ${data.response ? `<details class="graph-trace"><summary>Representative trace</summary><pre>${escapeHtml(data.response)}</pre></details>` : ""}
+    </div>`;
+}
+
+// Detail pane for the clicked node: the full step text (math typeset) plus the
+// extractor's own justification for the dependencies it drew.
+function renderGraphDetail() {
+  const el = document.getElementById("graphDetail");
+  const sel = GRAPH_PREVIEW.selected;
+  const payload = GRAPH_PREVIEW.payload;
+  if (!sel || !payload) {
+    el.innerHTML = '<div class="hint">Click a node for its step text and the extractor\'s reasoning; hover for a quick summary.</div>';
+    return;
+  }
+  const data = payload.variants[sel.variant] || {};
+  const graph = data[GRAPH_PREVIEW.mode];
+  const node = ((graph && graph.nodes) || []).find(n => n.id === sel.id);
+  if (!node) { el.innerHTML = '<div class="hint">That node is not present in this view.</div>'; return; }
+  const ids = dagNodeIds(node);
+  const heading = node.type === "step"
+    ? `<span class="vtag ${sel.variant}">${sel.variant}</span> Step ${ids.join(", ")}`
+      + (node.macro_action_tag ? ` <span class="dag-key tag-${node.macro_action_tag}">${node.macro_action_tag}</span>` : "")
+    : `<span class="vtag ${sel.variant}">${sel.variant}</span> ${node.type === "problem" ? "Problem statement" : "External knowledge"}`;
+  const steps = ids.map(id => {
+    const text = stepTextFor(data.steps, id);
+    return text ? `<div class="graph-step"><div class="answer-label">Step ${id}</div>
+      <div class="problem-text">${renderMathField(text)}</div></div>` : "";
+  }).join("");
+  el.innerHTML = `<div class="graph-detail-head">${heading}</div>${steps}`
+    + (node.analysis ? `<div class="graph-step"><div class="answer-label">Extractor's reasoning</div>
+        <div class="hint">${escapeHtml(node.analysis)}</div></div>` : "");
+  typesetMath(el);
+}
+
+// --------------------------------------------------------------------------
 // Filter section: the required pipeline stage between Pull and Generate. It
 // works over the non-generated pool (Original / Kept / Rejected, from
 // /api/filter_pool) — separate from Generate's Kept-only base pool. Evaluate
@@ -2286,6 +2627,35 @@ document.getElementById("dsReload").addEventListener("click", () => {
 // (filter search removed; threshold slider + Clear are wired inside renderFilterFacets)
 document.getElementById("savePerturbation").addEventListener("click", savePerturbation);
 document.getElementById("verifyEvalBtn").addEventListener("click", evalCurrentPending);
+// Reasoning-graph preview: open/close, raw<->compressed, and node selection.
+document.getElementById("verifyGraphBtn").addEventListener("click", previewCurrentGraphs);
+document.getElementById("graphModalClose").addEventListener("click", closeGraphModal);
+document.getElementById("graphModalBackdrop").addEventListener("click", closeGraphModal);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !document.getElementById("graphModal").classList.contains("hidden")) closeGraphModal();
+});
+document.getElementById("graphModeToggle").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn || btn.dataset.mode === GRAPH_PREVIEW.mode) return;
+  GRAPH_PREVIEW.mode = btn.dataset.mode;
+  renderGraphModal();
+});
+// Browse cards: a "graphs N/3" badge is a button when a preview is stored.
+// Delegated on the list container (survives render() replacing its innerHTML).
+document.getElementById("list").addEventListener("click", (e) => {
+  const btn = e.target.closest(".graph-view-btn");
+  if (!btn) return;
+  openStoredGraphs(btn.dataset.pid);
+});
+document.getElementById("graphCols").addEventListener("click", (e) => {
+  const g = e.target.closest(".dag-node");
+  if (!g) return;
+  GRAPH_PREVIEW.selected = { variant: g.dataset.variant, id: g.dataset.nodeId };
+  document.getElementById("graphCols").querySelectorAll(".dag-node.selected")
+    .forEach(n => n.classList.remove("selected"));
+  g.classList.add("selected");
+  renderGraphDetail();
+});
 document.getElementById("llmGenerateBtn").addEventListener("click", llmGenerate);
 document.getElementById("generateRefresh").addEventListener("click", refreshGenerateSection);
 // Model selection (delegated — cards are re-rendered). GPU cards are static.

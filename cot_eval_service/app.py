@@ -10,6 +10,8 @@ over an SSH tunnel:
     POST /eval/solvability  -> does the math model solve one problem? pass-rate over N samples.
     POST /eval/pair         -> solvability of original/simple/hard + GED structural
                                similarity of simple & hard vs the original reasoning.
+    POST /eval/graph        -> ONE variant's reasoning DAG (raw + compressed) with no GED,
+                               so the extraction can be inspected before it is scored.
     GET  /health            -> {model, cuda, ged_ready}
 
 It imports (never re-implements) the repo's logic:
@@ -169,28 +171,65 @@ def _pick_response(responses, correct):
     return responses[0] if responses else ""
 
 
-def _build_compressed_graph(problem: str, response_text: str, client):
-    """response text -> segmented steps -> LLM-tagged DAG -> compressed DiGraph.
+def _build_graphs(problem: str, response_text: str, client):
+    """response text -> segmented steps -> LLM-tagged DAG -> raw + compressed DiGraph.
 
-    Returns (compressed_graph, None) on success, or (None, reason) so a single
-    failed trace degrades to "no GED" (with a real reason) rather than a 500 or
-    a silent, unexplained skip.
+    Returns (steps, dag, raw_graph, compressed_graph, None) on success. On failure
+    the trailing element is a reason string and the later elements are None, so a
+    single failed trace degrades to "no graph" (with a real reason) rather than a
+    500 or a silent, unexplained skip. The intermediates (steps, dag, raw) are
+    returned so /eval/graph can show what the extractor actually produced;
+    /eval/pair only needs the compressed graph.
     """
     from data_analysis.cot_segmenter import segment_response
     from data_analysis.dag_compressor import build_digraph_with_tags, compress_dag_combined
 
     step_strings = segment_response(response_text or "")
     if not step_strings:
-        return None, "no reasoning steps could be segmented from the response"
+        return None, None, None, None, "no reasoning steps could be segmented from the response"
     steps = [{"index": i + 1, "text": s} for i, s in enumerate(step_strings)]
     dag, error = client.analyze_reasoning_chain(problem, steps)
     if error or not dag:
         reason = error or "analyze_reasoning_chain returned no DAG"
         log.warning("analyze_reasoning_chain returned no DAG (error=%s)", error)
-        return None, reason
+        return steps, None, None, None, reason
     graph = build_digraph_with_tags(dag)
     compressed, _ = compress_dag_combined(graph)
-    return compressed, None
+    return steps, dag, graph, compressed, None
+
+
+def _build_compressed_graph(problem: str, response_text: str, client):
+    """(compressed_graph, reason) — the /eval/pair view of _build_graphs."""
+    _steps, _dag, _raw, compressed, reason = _build_graphs(problem, response_text, client)
+    return compressed, reason
+
+
+def _graph_payload(graph):
+    """networkx DiGraph -> JSON-safe {nodes, links}.
+
+    Node ids are heterogeneous (int step ids, int 0 for the problem, the string
+    "External"), so they are coerced to str — the frontend only ever uses them as
+    labels and edge keys. Node attrs (type / macro_action_tag / analysis /
+    absorbed_nodes) ride along as-is.
+    """
+    if graph is None:
+        return None
+    import networkx as nx
+    try:
+        # networkx >= 3.4 wants the key named explicitly (the implicit "links"
+        # default is deprecated there); older versions have no such kwarg.
+        data = nx.node_link_data(graph, edges="links")
+    except TypeError:
+        data = nx.node_link_data(graph)
+    for node in data.get("nodes", []):
+        node["id"] = str(node.get("id"))
+        absorbed = node.get("absorbed_nodes")
+        if absorbed is not None:
+            node["absorbed_nodes"] = [str(a) for a in absorbed]
+    for link in data.get("links", []):
+        link["source"] = str(link.get("source"))
+        link["target"] = str(link.get("target"))
+    return {"nodes": data.get("nodes", []), "links": data.get("links", [])}
 
 
 def _make_ged_client():
@@ -225,6 +264,17 @@ class Variant(BaseModel):
     ground_truth: str = ""
 
 
+class GraphRequest(BaseModel):
+    problem: str
+    ground_truth: str = ""
+    # One representative trace is all a graph needs, so the preview defaults to a
+    # single sample — far cheaper than a pair eval's 3 x N.
+    n: int = 1
+    dataset_type: str = "original"
+    temperature: float = 1.0
+    max_tokens: int = MAX_TOKENS
+
+
 class PairRequest(BaseModel):
     original: Variant
     simple: Variant
@@ -255,6 +305,41 @@ def eval_solvability(req: SolvabilityRequest):
     return {"pass_rate": pass_rate, "n": len(responses),
             "correct": correct, "model": MODEL_NAME,
             "errors": errors, "responses": [r[:6000] for r in responses]}
+
+
+@app.post("/eval/graph")
+def eval_graph(req: GraphRequest):
+    """One variant's reasoning DAG, with NO graph-edit-distance computed.
+
+    Same pipeline /eval/pair feeds into GED (sample -> pick a representative trace
+    -> segment -> LLM-tag -> compress), but it returns the graphs instead of
+    scoring them, so the extraction can be inspected before the pair eval is run.
+    Extraction failures come back as an "error" string with null graphs rather
+    than a 500 — one bad variant should not sink the whole preview.
+    """
+    responses = generate(req.problem, req.n, req.temperature, req.max_tokens)
+    correct, pass_rate, errors = score(req.problem, responses, req.ground_truth, req.dataset_type)
+    rep = _pick_response(responses, correct)
+    out = {"pass_rate": pass_rate, "n": len(responses), "model": MODEL_NAME,
+           "response": rep[:6000], "grader_errors": [e for e in errors if e],
+           "steps": None, "dag": None, "raw": None, "compressed": None, "error": None}
+
+    if not _ged_enabled():
+        out["error"] = (f"DAG extraction disabled: {_ged_key_env()} is not set on the "
+                        "eval service.")
+        return out
+    try:
+        client = _make_ged_client()
+        steps, dag, raw, compressed, reason = _build_graphs(req.problem, rep, client)
+        out["steps"] = steps
+        out["dag"] = dag
+        out["raw"] = _graph_payload(raw)
+        out["compressed"] = _graph_payload(compressed)
+        out["error"] = reason
+    except Exception as e:  # noqa: BLE001 - surfaced to the UI as a per-variant error
+        log.warning("graph extraction failed: %s", e)
+        out["error"] = f"graph extraction failed: {e}"
+    return out
 
 
 @app.post("/eval/pair")

@@ -17,9 +17,17 @@
 # --- Default: local Ollama, no key, no rate limit, no billing --------------
 # Reaches the SAME ollama serve instance llm_generate.py uses (same remote
 # host, localhost:11434 — no tunnel needed since the shim runs there too).
-# Needs the model pulled on the remote (`ollama pull qwen2.5:14b`).
+# Needs the model pulled on the remote (`ollama pull qwen2.5:7b`).
+#
+# 7b, not 14b, on purpose — measured, not assumed. Over a 30-variant backfill the
+# 7b got 23/30 DAG extractions contract-valid; re-running the failures under 14b
+# scored identically (8/15 vs 8/15) while taking ~55% longer per record. Extraction
+# failures track reasoning-trace LENGTH (median 11 steps for passes vs 17 for
+# failures), not model size. The way to recover coverage is a second pass —
+# `python scripts/backfill_graphs.py --retry-incomplete` — whose results merge
+# per-variant. Don't "upgrade" this to 14b without re-measuring.
 export COT_EVAL_GED_PROVIDER=ollama
-export COT_EVAL_GED_MODEL=qwen2.5:14b
+export COT_EVAL_GED_MODEL=qwen2.5:7b
 
 # --- Fallback: Gemini (hosted, free tier is quota-limited) ------------------
 # Uncomment to switch back. On this project's Google AI Studio account, only

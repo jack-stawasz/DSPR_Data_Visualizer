@@ -67,6 +67,13 @@ DATA_DIR = ROOT / "data"
 
 DATASET_FILE  = DATA_DIR / "DSPR_dataset.json"
 
+# Persisted reasoning-graph previews, one JSON object per line keyed by problem_id
+# (last line for an id wins, so a re-run just appends). It lives in a SUBDIRECTORY
+# on purpose: _collect_all_records() sweeps every top-level *.jsonl in data/ into
+# the record pool, and these are previews, not records.
+GRAPH_STORE_DIR  = DATA_DIR / "graph_previews"
+GRAPH_STORE_FILE = GRAPH_STORE_DIR / "reasoning_graphs.jsonl"
+
 # Status field values — used throughout for filtering, never shown as UI tags.
 # Pipeline: Pull → Filter → Generate → Verify, gated by this field.
 STATUS_ORIGINAL   = "Original (unperturbed)"   # pulled, not yet filtered
@@ -676,6 +683,107 @@ def api_llm_connect():
 _EVAL_QUEUE: "queue.Queue" = queue.Queue()
 _EVAL_JOBS = {}                 # problem_id -> job dict (state/result/error/…)
 _EVAL_LOCK = threading.Lock()   # serialises the read-modify-write of a record's eval
+# Reasoning-graph previews (kind "graphs") are diagnostic, not a scored result, and
+# each one carries three variants' step text + nodes/edges. Caching them in memory
+# instead of on the record keeps data/DSPR_dataset.json — one file rewritten on
+# every save — from growing by tens of MB. Lost on restart, which is fine here.
+_EVAL_GRAPHS = {}               # problem_id -> graph-preview payload
+
+
+_GRAPH_STORE_LOCK = threading.Lock()
+_GRAPH_STORE_CACHE = None       # problem_id -> stored payload (lazily loaded)
+
+
+def _graph_store_slim(payload: dict) -> dict:
+    """Persistable form of a preview: everything the viewer reads, minus `dag`.
+
+    `dag` is the extractor's raw JSON, which `raw` is already built from and the
+    frontend never touches — dropping it saves ~4 KB of ~28 KB per record.
+    """
+    slim = dict(payload)
+    slim["variants"] = {
+        name: {k: v for k, v in (variant or {}).items() if k != "dag"}
+        for name, variant in (payload.get("variants") or {}).items()
+    }
+    return slim
+
+
+def _graph_store_merge(old: dict, new: dict) -> dict:
+    """Later payload wins, EXCEPT that a variant which produced no graph never
+    displaces one that did.
+
+    Extraction is flaky and non-deterministic (see the model-capability note in
+    CLAUDE.md), so re-running a record to fix variant A can regress variant B.
+    Without this, one unlucky retry silently hides a good graph behind a failure.
+    Carried-over variants are marked so the viewer can tell they predate the rest.
+    """
+    if not old:
+        return new
+    merged = dict(new)
+    variants = dict(new.get("variants") or {})
+    for name, prev in (old.get("variants") or {}).items():
+        fresh = variants.get(name) or {}
+        if not fresh.get("compressed") and (prev or {}).get("compressed"):
+            carried = dict(prev)
+            carried["carried_over"] = True
+            variants[name] = carried
+    merged["variants"] = variants
+    return merged
+
+
+def _graph_store_all() -> dict:
+    """All persisted previews, keyed by problem_id.
+
+    Lines for the same id are merged newest-last via _graph_store_merge, so the
+    file stays a plain append-only log while the effective view keeps the best
+    graph seen for each variant.
+    """
+    global _GRAPH_STORE_CACHE
+    with _GRAPH_STORE_LOCK:
+        if _GRAPH_STORE_CACHE is None:
+            store = {}
+            for rec in read_jsonl(GRAPH_STORE_FILE):
+                pid = rec.get("problem_id")
+                if pid is not None:
+                    store[pid] = _graph_store_merge(store.get(pid), rec)
+            _GRAPH_STORE_CACHE = store
+        return _GRAPH_STORE_CACHE
+
+
+def _graph_store_get(pid):
+    return _graph_store_all().get(pid)
+
+
+def _graph_store_put(payload: dict):
+    """Append one preview to the sidecar. Append-only: a regenerated preview adds
+    a line rather than rewriting the file, and the loader keeps the last one."""
+    pid = payload.get("problem_id")
+    if pid is None:
+        return
+    slim = _graph_store_slim(payload)
+    store = _graph_store_all()  # ensure the cache is built before we mutate it
+    GRAPH_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    with _GRAPH_STORE_LOCK:
+        # Append the run verbatim (the file stays an honest log of what happened);
+        # the in-memory view is the merged one readers get.
+        with GRAPH_STORE_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(slim, ensure_ascii=False) + "\n")
+        if _GRAPH_STORE_CACHE is not None:
+            _GRAPH_STORE_CACHE[pid] = _graph_store_merge(store.get(pid), slim)
+
+
+def _parse_pid(raw):
+    """Query-string problem_id -> the int the job/record maps use (None if absent).
+
+    Falls back to the raw string so a non-numeric id still looks itself up rather
+    than 400-ing.
+    """
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return raw
 
 
 def _eval_service_status() -> dict:
@@ -735,18 +843,52 @@ def _ensure_eval_connection() -> dict:
                       "did not respond within 12s — is uvicorn running on the remote?")}
 
 
+def _run_graph_job(pid, record, job):
+    """Worker body for a "graphs" job: the pre-GED reasoning-DAG preview.
+
+    One shim call per variant so the UI gets a real 1/3 -> 3/3 progress readout
+    (same reason the solvability path samples one trial at a time). A variant that
+    fails extraction is kept in the payload with its error, so the other two still
+    render. The result is cached in _EVAL_GRAPHS, never written to the record.
+    """
+    import cot_eval
+    variants = {}
+    warnings = []
+    model = None
+    job["progress"] = {"variant": 0, "variants": 3}
+    for i, name in enumerate(("original", "simple", "hard"), start=1):
+        try:
+            res = cot_eval.eval_graph(record, name)
+            model = res.get("model") or model
+            if res.get("error"):
+                warnings.append(f"{name}: {res['error']}")
+        except Exception as e:  # noqa: BLE001 - one bad variant must not sink the preview
+            res = {"error": str(e)}
+            warnings.append(f"{name}: {e}")
+        variants[name] = res
+        job["progress"] = {"variant": i, "variants": 3}
+    payload = {"kind": "graphs", "problem_id": pid, "variants": variants,
+               "model": model, "generated_at": now_iso(), "warnings": warnings}
+    _EVAL_GRAPHS[pid] = payload
+    _graph_store_put(payload)   # survive a restart; still never on the record
+    return payload
+
+
 def _run_eval_job(pid):
     """Worker body for one queued evaluation: pick solvability vs pair by the
-    record's status, call the shim, and cache the result onto the record."""
+    record's status (or the graph preview when the job asked for it), call the
+    shim, and cache the result onto the record."""
     import cot_eval
     record = _find_record(pid)
     if record is None:
         raise RuntimeError(f"no record with id {pid}")
+    job = _EVAL_JOBS.get(pid)
+    if job is not None and job.get("kind") == "graphs":
+        return _run_graph_job(pid, record, job)
     if record.get("status") in STATUS_FILTER_POOL:
         # Sample one trial at a time so the UI can show a live 0→N trial bar
         # (the shim has no per-sample callback within a single n=N call).
         n = cot_eval.COT_EVAL_N
-        job = _EVAL_JOBS.get(pid)
         if job is not None:
             job["progress"] = {"trial": 0, "trials": n}
         correct = 0
@@ -855,7 +997,10 @@ def api_eval_connect():
 @app.route("/api/eval_record", methods=["POST"])
 def api_eval_record():
     """Enqueue a background evaluation for one record (solvability if Original,
-    full pair otherwise). Idempotent: an in-flight job is returned as-is."""
+    full pair otherwise). Idempotent: an in-flight job is returned as-is.
+
+    Pass kind="graphs" to run the pre-GED reasoning-DAG preview instead of scoring.
+    """
     body = request.get_json(force=True, silent=True) or {}
     pid = body.get("problem_id")
     if pid is None:
@@ -863,7 +1008,10 @@ def api_eval_record():
     record = _find_record(pid)
     if record is None:
         return jsonify({"ok": False, "error": f"no record with id {pid}"}), 404
-    kind = "solvability" if record.get("status") in STATUS_FILTER_POOL else "pair"
+    if body.get("kind") == "graphs":
+        kind = "graphs"
+    else:
+        kind = "solvability" if record.get("status") in STATUS_FILTER_POOL else "pair"
     job = _EVAL_JOBS.get(pid)
     if job and job.get("state") in ("queued", "running"):
         return jsonify({"ok": True, "state": job["state"], "kind": job.get("kind")})
@@ -878,22 +1026,62 @@ def api_eval_record():
 def api_eval_status():
     """Poll a record's evaluation job. Returns the job state plus (when done) the
     cached evaluation block from the record."""
-    raw = request.args.get("problem_id")
-    if raw is None:
+    pid = _parse_pid(request.args.get("problem_id"))
+    if pid is None:
         return jsonify({"ok": False, "error": "problem_id required"}), 400
-    try:
-        pid = int(raw)
-    except (TypeError, ValueError):
-        pid = raw
     job = _EVAL_JOBS.get(pid)
     record = _find_record(pid)
     evaluation = (record or {}).get("evaluation")
     if job is None:
         # No job this session — report any cached result already on the record.
         return jsonify({"ok": True, "state": "idle", "evaluation": evaluation})
+    if job.get("kind") == "graphs":
+        # A graph preview is not an evaluation: it never lands on the record, so
+        # it rides its own key rather than shadowing the cached scores.
+        return jsonify({"ok": True, "state": job["state"], "kind": "graphs",
+                        "error": job.get("error"), "progress": job.get("progress"),
+                        "graphs": job.get("result"), "evaluation": evaluation})
     return jsonify({"ok": True, "state": job["state"], "kind": job.get("kind"),
                     "error": job.get("error"), "progress": job.get("progress"),
                     "evaluation": job.get("result") or evaluation})
+
+
+@app.route("/api/eval_graphs")
+def api_eval_graphs():
+    """A record's reasoning-graph preview, if one exists — this session's in-memory
+    copy first, else the persisted sidecar — so reopening the viewer (or opening it
+    after a restart) doesn't re-run the sampling + extraction."""
+    pid = _parse_pid(request.args.get("problem_id"))
+    if pid is None:
+        return jsonify({"ok": False, "error": "problem_id required"}), 400
+    graphs = _EVAL_GRAPHS.get(pid) or _graph_store_get(pid)
+    return jsonify({"ok": True, "cached": graphs is not None, "graphs": graphs})
+
+
+def _graph_coverage(payload: dict) -> dict:
+    """{graphed, total, carried, generated_at} summary of one preview payload."""
+    variants = (payload or {}).get("variants") or {}
+    return {
+        "graphed": sum(1 for v in variants.values() if (v or {}).get("compressed")),
+        "total": len(variants) or 3,
+        "carried": sum(1 for v in variants.values() if (v or {}).get("carried_over")),
+        "generated_at": (payload or {}).get("generated_at"),
+    }
+
+
+@app.route("/api/eval_graphs_index")
+def api_eval_graphs_index():
+    """Which records have a stored preview, and how complete each one is.
+
+    Lets the Browse view badge records that already have graphs — and, more
+    importantly, avoids offering a one-click view that would silently start a
+    multi-minute GPU job for a record with nothing stored.
+    """
+    index = {str(pid): _graph_coverage(payload)
+             for pid, payload in _graph_store_all().items()}
+    for pid, payload in _EVAL_GRAPHS.items():      # this session's, not yet merged
+        index.setdefault(str(pid), _graph_coverage(payload))
+    return jsonify({"ok": True, "count": len(index), "index": index})
 
 
 def _status_payload(status: str) -> dict:
