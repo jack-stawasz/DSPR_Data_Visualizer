@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must always use LF, even on Windows checkouts,
+# or the shebang line breaks (bash sees "/bin/bash\r").
+*.sh text eol=lf
+*.sh.example text eol=lf
